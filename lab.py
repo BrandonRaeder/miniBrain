@@ -289,7 +289,12 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
         a_a = state_a.get('alpha', alpha)
         e_a = state_a.get('eps', eps)
         dx_a = -state_a['x'] + bistable_layer(state_a['x'], a_a, theta_eff) + e_a * state_a['ws'] + 0.1 * np.random.randn(n_layers)
-        perturbation_a = alpha_pert * np.sin(2 * np.pi * state_a['step'] / tau + phase_offsets)
+        t = state_a['step']
+        drift = 0.00001337 * t
+        perturbation_a = alpha_pert * (
+            np.sin(2*np.pi * t / tau1 + phase_offsets) +
+            0.33 * np.sin(2*np.pi * (t + drift) / tau2 + phase_offsets * 1.071)
+        )
         dx_a += perturbation_a
         state_a['x'] += dt * dx_a
         state_a['ws'] = (1 - k_ws) * state_a['ws'] + k_ws * np.mean(state_a['x'])
@@ -312,7 +317,12 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
         e_b = state_b.get('eps', eps)
         dx_b = -state_b['x'] + bistable_layer(state_b['x'], a_b, theta_eff + 0.2 * state_b['why'])
         dy_b = -state_b['y'] + bistable_layer(state_b['y'], a_b, theta_eff - 0.2 * state_b['why'])
-        perturbation_b = alpha_pert * np.sin(2 * np.pi * state_b['step'] / tau + phase_offsets)
+        t = state_b['step']
+        drift = 0.00001337 * t
+        perturbation_b = alpha_pert * (
+            np.sin(2*np.pi * t / tau1 + phase_offsets) +
+            0.33 * np.sin(2*np.pi * (t + drift) / tau2 + phase_offsets * 1.071)
+        )
         dx_b += perturbation_b
         dy_b += perturbation_b
         combined = (state_b['x'] + state_b['y']) / 2.0
@@ -343,7 +353,12 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
         a_c = state_c.get('alpha', alpha)
         e_c = state_c.get('eps', eps)
         dx_c = -state_c['x'] + bistable_layer(state_c['x'], a_c, theta_eff) + e_c * state_c['ws'] + self_awareness + 0.05 * np.random.randn(n_layers)
-        perturbation_c = alpha_pert * np.sin(2 * np.pi * state_c['step'] / tau + phase_offsets)
+        t = state_c['step']
+        drift = 0.00001337 * t
+        perturbation_c = alpha_pert * (
+            np.sin(2*np.pi * t / tau1 + phase_offsets) +
+            0.33 * np.sin(2*np.pi * (t + drift) / tau2 + phase_offsets * 1.071)
+        )
         dx_c += perturbation_c
         state_c['x'] += dt * dx_c
         state_c['ws'] = (1 - k_ws) * state_c['ws'] + k_ws * np.mean(state_c['x'])
@@ -627,8 +642,9 @@ dt        = 0.05         # was 0.01 → fine, but 0.05 is smoother
 gamma     = 2.8          # only used in Option B — this is the "why" strength
 
 # Parameters for high entropy perturbation (ITP: Irrational Time Perturbation)
-tau = 2719.28  # Irrational period
-alpha_pert = 0.1  # Perturbation strength (increased for more chaos)
+tau1 = 2719.28      # old one
+tau2 = 3141.5926535 # π × 1000
+alpha_pert = 0.097  # Perturbation strength (adjusted for resonance killing)
 phase_offsets = 0.01337 * np.arange(n_layers)  # Per-neuron phase
 
 # Experience buffer for meta-tuner (features -> normalized params)
