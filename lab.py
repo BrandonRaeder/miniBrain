@@ -326,7 +326,7 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
             lz_a = lz_complexity((seq_a > 0).astype(int).flatten())
         else:
             lz_a = 0
-        diag_a.set_text(f"Current R: {R_a_display:.4f}\nHighest R: {max_R_display:.4f}\nEntropy: {entropy:.2f}\nLyapunov: {lyap:.4f}\nComplexity: {lz_a:.2f}")
+        diag_a.set_text(f"Current R: {R_a_display:.4f}\nHighest R: {max_R_display:.4f}\nEntropy: {entropy:.2f}\nLyapunov: {lyap:.4f}\nLZ Complexity: {lz_a:.2f}")
 
         # Update Option B
         state_b['why'] = why_loop_driver(state_b['why'], 1.2)
@@ -368,7 +368,7 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
             lz_b = lz_complexity((seq_b > 0).astype(int).flatten())
         else:
             lz_b = 0
-        diag_b.set_text(f"Current R: {R_b_display:.4f}\nHighest R: {max_R_display:.4f}\nEntropy: {entropy:.2f}\nLyapunov: {lyap:.4f}\nComplexity: {lz_b:.2f}")
+        diag_b.set_text(f"Current R: {R_b_display:.4f}\nHighest R: {max_R_display:.4f}\nEntropy: {entropy:.2f}\nLyapunov: {lyap:.4f}\nLZ Complexity: {lz_b:.2f}")
         
         # Option C: Self-referential dynamics
         predictor = state_c.get('predictor', None)
@@ -424,7 +424,7 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
             lz_c = lz_complexity((seq_c > 0).astype(int).flatten())
         else:
             lz_c = 0
-        diag_c.set_text(f"Current R: {R_c_display:.4f}\nHighest R: {max_R_display:.4f}\nEntropy: {entropy:.2f}\nLyapunov: {lyap:.4f}\nComplexity: {lz_c:.2f}")
+        diag_c.set_text(f"Current R: {R_c_display:.4f}\nHighest R: {max_R_display:.4f}\nEntropy: {entropy:.2f}\nLyapunov: {lyap:.4f}\nLZ Complexity: {lz_c:.2f}")
         # Update phase charts for Option A, B, C
         line_a.set_data(np.arange(len(state_a['R_hist'])), state_a['R_hist'])
         # Rolling window for R-phase charts
