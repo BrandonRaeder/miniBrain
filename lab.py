@@ -317,7 +317,16 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
         R_a_display = R_a if np.isfinite(R_a) else 0.0
         max_R_display = state_a['max_R'] if np.isfinite(state_a['max_R']) else 0.0
         complexity_a = entropy + lyap
-        diag_a.set_text(f"Current R: {R_a_display:.4f}\nHighest R: {max_R_display:.4f}\nEntropy: {entropy:.2f}\nLyapunov: {lyap:.4f}\nComplexity: {complexity_a:.2f}")
+        n_a = min(state_a['step'], 2000)
+        if n_a > 0:
+            seq_a = np.zeros((n_layers, n_a))
+            for i in range(n_a):
+                idx = (state_a['step'] - n_a + i) % 2000
+                seq_a[:, i] = state_a['x_history'][:, idx]
+            lz_a = lz_complexity((seq_a > 0).astype(int).flatten())
+        else:
+            lz_a = 0
+        diag_a.set_text(f"Current R: {R_a_display:.4f}\nHighest R: {max_R_display:.4f}\nEntropy: {entropy:.2f}\nLyapunov: {lyap:.4f}\nComplexity: {lz_a:.2f}")
 
         # Update Option B
         state_b['why'] = why_loop_driver(state_b['why'], 1.2)
@@ -350,7 +359,16 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
         R_b_display = R_b if np.isfinite(R_b) else 0.0
         max_R_display = state_b['max_R'] if np.isfinite(state_b['max_R']) else 0.0
         complexity_b = entropy + lyap
-        diag_b.set_text(f"Current R: {R_b_display:.4f}\nHighest R: {max_R_display:.4f}\nEntropy: {entropy:.2f}\nLyapunov: {lyap:.4f}\nComplexity: {complexity_b:.2f}")
+        n_b = min(state_b['step'], 2000)
+        if n_b > 0:
+            seq_b = np.zeros((n_layers, n_b))
+            for i in range(n_b):
+                idx = (state_b['step'] - n_b + i) % 2000
+                seq_b[:, i] = state_b['combined_history'][:, idx]
+            lz_b = lz_complexity((seq_b > 0).astype(int).flatten())
+        else:
+            lz_b = 0
+        diag_b.set_text(f"Current R: {R_b_display:.4f}\nHighest R: {max_R_display:.4f}\nEntropy: {entropy:.2f}\nLyapunov: {lyap:.4f}\nComplexity: {lz_b:.2f}")
         
         # Option C: Self-referential dynamics
         predictor = state_c.get('predictor', None)
@@ -397,7 +415,16 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
         R_c_display = R_c if np.isfinite(R_c) else 0.0
         max_R_display = state_c['max_R'] if np.isfinite(state_c['max_R']) else 0.0
         complexity_c = entropy + lyap
-        diag_c.set_text(f"Current R: {R_c_display:.4f}\nHighest R: {max_R_display:.4f}\nEntropy: {entropy:.2f}\nLyapunov: {lyap:.4f}\nComplexity: {complexity_c:.2f}")
+        n_c = min(state_c['step'], 2000)
+        if n_c > 0:
+            seq_c = np.zeros((n_layers, n_c))
+            for i in range(n_c):
+                idx = (state_c['step'] - n_c + i) % 2000
+                seq_c[:, i] = state_c['x_history'][:, idx]
+            lz_c = lz_complexity((seq_c > 0).astype(int).flatten())
+        else:
+            lz_c = 0
+        diag_c.set_text(f"Current R: {R_c_display:.4f}\nHighest R: {max_R_display:.4f}\nEntropy: {entropy:.2f}\nLyapunov: {lyap:.4f}\nComplexity: {lz_c:.2f}")
         # Update phase charts for Option A, B, C
         line_a.set_data(np.arange(len(state_a['R_hist'])), state_a['R_hist'])
         # Rolling window for R-phase charts
@@ -436,6 +463,7 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
             print("[animate_workspace_heatmap_forever] failed to start autotune thread:", e)
 
     plt.tight_layout()
+    plt.subplots_adjust(hspace=0.5, wspace=0.3)
     try:
         plt.show()
     finally:
@@ -891,7 +919,7 @@ R2, ws2 = simulate_reflective_hierarchy()
 
 plt.figure(figsize=(10,4))
 plt.subplot(1,2,1); plt.plot(R1); plt.title("Workspace Phase Coherence")
-plt.subplot(1,2,2); plt.plot(R2); plt.title("Reflective Why-Loop Hierarchy Coherence")
+plt.subplot(1,2,2); plt.plot(R2); plt.title("Reflective Hierarchy Coherence")
 plt.tight_layout(); # plt.show()
 
 # ---------- Example run ----------

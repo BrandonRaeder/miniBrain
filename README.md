@@ -9,6 +9,8 @@ miniBrain provides a compact, interactive environment to experiment with three r
 - **Option B**: Hierarchical reflective architecture.
 - **Option C**: Self-referential workspace that maintains and predicts a compressed self-model.
 
+These models are designed to sustain high entropy and coherence (R) indefinitely, enabling simulations to run for extremely long durations without degradation.
+
 The lab includes background autotuning (meta-tuner NN), perturbations to maintain entropy, and instrumentation for complexity metrics (Shannon entropy, Lyapunov proxy, Lempel-Ziv complexity, mutual information).
 
 ## Features

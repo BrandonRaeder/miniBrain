@@ -132,8 +132,7 @@ def simulate_self_referential_workspace(n_layers=100, T=2000, dt=0.01,
             predictor = SelfModelPredictor(input_dim=6, hidden_dim=16)
             # Quick training on history
             if len(self_model_hist) > 50:
-                # Increase training epochs to give predictor more data to learn
-                train_self_predictor(predictor, np.array(self_model_hist), n_epochs=500)
+                train_self_predictor(predictor, np.array(self_model_hist))
         
         predicted_self = predict_own_future(self_model, predictor)
         
@@ -238,7 +237,7 @@ class SelfModelPredictor(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-def train_self_predictor(model, self_model_history, n_epochs=500, lr=1e-3):
+def train_self_predictor(model, self_model_history, n_epochs=100, lr=1e-3):
     """Train the system to predict its own next state"""
     X = torch.tensor(self_model_history[:-1], dtype=torch.float32)
     y = torch.tensor(self_model_history[1:], dtype=torch.float32)
@@ -442,8 +441,7 @@ def animate_self_reference_realtime(n_layers=100, dt=0.05, auto_start=False, dur
         if state['step'] == 100:
             state['predictor'] = SelfModelPredictor(input_dim=6, hidden_dim=16)
         if state['step'] > 100 and state['step'] % 200 == 0 and len(state['self_model_hist']) > 50:
-            # Retrain predictor periodically with more epochs for stability
-            train_self_predictor(state['predictor'], np.array(state['self_model_hist']), n_epochs=500)
+            train_self_predictor(state['predictor'], np.array(state['self_model_hist']))
         
         # Predict
         if state['predictor'] is not None:
