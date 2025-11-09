@@ -618,7 +618,7 @@ def train_workspace_decoder(x_hist, ws_hist, subset_idx=None, alpha=1.0):
     return model, r2
 
 # === MAGIC EDGE-OF-LIFE PARAMETERS ===
-n_layers  = 1000          # can be 50–500, doesn't matter
+n_layers  = 100          # can be 50–500, doesn't matter
 alpha     = 1.95         # critical — bistable gain
 theta_eff = 0.0          # was 0.3 → kills the soul
 eps       = 0.08         # was 0.7 → way too strong
