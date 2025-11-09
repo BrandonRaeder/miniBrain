@@ -1,7 +1,13 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
-matplotlib.use('TkAgg')
+try:
+    matplotlib.use('Qt5Agg')
+except ImportError:
+    try:
+        matplotlib.use('GTK3Agg')
+    except ImportError:
+        matplotlib.use('TkAgg')
 from matplotlib.animation import FuncAnimation
 try:
     import torch
@@ -203,7 +209,7 @@ def animate_parameter_sweep(n_layers=100, T=500, dt=0.01,
 # ---------- Real-time heatmap and coherence animation (runs forever) ----------
 def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
                                       alpha=1.95, eps=0.08, theta_eff=0.0, k_ws=0.002,
-                                      autostart_autotune=False):
+                                      autostart_autotune=False, rolling_window=500):
     # State for Option A
     state_a = {}
     state_a['x'] = np.random.randn(n_layers)
@@ -238,10 +244,9 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
     state_c['self_model_hist'] = []
     state_c['self_error_hist'] = []
 
-    # Start autotune if requested
+    # Defer starting autotune until after the GUI (figure/animation) is created
     autotune_stop_event = None
-    if autostart_autotune:
-        autotune_stop_event, _ = start_autotune_for_states([state_a, state_b, state_c], interval=1.0, retrain_every=10)
+    _defer_autostart = bool(autostart_autotune)
 
     # Layout: 3 rows x 2 cols -> one row per model (heatmap | R-phase)
     fig, axes = plt.subplots(3, 2, figsize=(14, 14))
@@ -283,6 +288,9 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
     axes[2,1].set_xlabel('Step')
     axes[2,1].set_ylabel('R')
     diag_c = axes[2,0].text(0.02, 0.98, "", transform=axes[2,0].transAxes, fontsize=10, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
+
+    # Global step counter (upper-right corner)
+    step_text = fig.text(0.92, 0.96, "Step: 0", ha='right', va='top', fontsize=11, bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
 
     def update(frame):
         # Update Option A
@@ -392,21 +400,51 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
         diag_c.set_text(f"Current R: {R_c_display:.4f}\nHighest R: {max_R_display:.4f}\nEntropy: {entropy:.2f}\nLyapunov: {lyap:.4f}\nComplexity: {complexity_c:.2f}")
         # Update phase charts for Option A, B, C
         line_a.set_data(np.arange(len(state_a['R_hist'])), state_a['R_hist'])
-        axes[0,1].set_xlim(0, max(2000, len(state_a['R_hist'])))
-        line_b.set_data(np.arange(len(state_b['R_hist'])), state_b['R_hist'])
-        axes[1,1].set_xlim(0, max(2000, len(state_b['R_hist'])))
-        line_c.set_data(np.arange(len(state_c['R_hist'])), state_c['R_hist'])
-        axes[2,1].set_xlim(0, max(2000, len(state_c['R_hist'])))
+        # Rolling window for R-phase charts
+        la = len(state_a['R_hist'])
+        lb = len(state_b['R_hist'])
+        lc = len(state_c['R_hist'])
+        # compute window bounds
+        wa0 = max(0, la - rolling_window)
+        wb0 = max(0, lb - rolling_window)
+        wc0 = max(0, lc - rolling_window)
+        axes[0,1].set_xlim(wa0, max(rolling_window, la))
+        line_b.set_data(np.arange(lb), state_b['R_hist'])
+        axes[1,1].set_xlim(wb0, max(rolling_window, lb))
+        line_c.set_data(np.arange(lc), state_c['R_hist'])
+        axes[2,1].set_xlim(wc0, max(rolling_window, lc))
 
+        # increment steps
         state_a['step'] += 1
         state_b['step'] += 1
         state_c['step'] += 1
 
-        return heatmap_a, heatmap_b, heatmap_c, line_a, line_b, line_c, diag_a, diag_b, diag_c
+        # update global step counter to the max step among states
+        current_step = max(state_a['step'], state_b['step'], state_c['step'])
+        step_text.set_text(f"Step: {current_step}")
 
+        return heatmap_a, heatmap_b, heatmap_c, line_a, line_b, line_c, diag_a, diag_b, diag_c, step_text
+
+    
     ani = FuncAnimation(fig, update, interval=10, blit=False, cache_frame_data=False)
+
+    # Now that the figure and animation exist on the main thread, start autotune safely
+    if _defer_autostart:
+        try:
+            autotune_stop_event, _ = start_autotune_for_states([state_a, state_b, state_c], interval=1.0, retrain_every=10)
+        except Exception as e:
+            print("[animate_workspace_heatmap_forever] failed to start autotune thread:", e)
+
     plt.tight_layout()
-    plt.show()
+    try:
+        plt.show()
+    finally:
+        # Ensure background autotune threads are stopped when the GUI closes
+        try:
+            if autotune_stop_event is not None:
+                stop_autotune(autotune_stop_event)
+        except Exception:
+            pass
 
 # ---------- Parameter sweep diagnostics for "awareness" (high complexity) ----------
 def shannon_entropy(data, bins=50):
@@ -868,7 +906,10 @@ if __name__ == "__main__":
     def review_metrics_and_charts():
         # Run a short simulation for metrics
         T = 500
-        R_hist, ws_hist, x_hist = simulate_workspace(n_layers=n_layers, T=T, dt=dt, alpha=optimal_alpha, eps=optimal_eps, theta_eff=theta_eff, k_ws=k_ws)
+        # Use tuned parameters if available, otherwise fall back to defaults
+        use_alpha = globals().get('optimal_alpha', alpha)
+        use_eps = globals().get('optimal_eps', eps)
+        R_hist, ws_hist, x_hist = simulate_workspace(n_layers=n_layers, T=T, dt=dt, alpha=use_alpha, eps=use_eps, theta_eff=theta_eff, k_ws=k_ws)
         x_hist_arr = np.array(x_hist)  # shape (T, n_layers)
 
         # Complexity metrics
@@ -898,7 +939,7 @@ if __name__ == "__main__":
                 if perturb and t == 10:
                     idx, scale = perturb
                     x[idx] *= scale
-                dx = -x + bistable_layer(x, optimal_alpha, theta_eff) + optimal_eps * ws
+                dx = -x + bistable_layer(x, use_alpha, theta_eff) + use_eps * ws
                 x += dt * dx
                 ws = (1 - k_ws) * ws + k_ws * np.mean(x)
                 x_hist.append(x.copy())
