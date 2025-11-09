@@ -6,7 +6,7 @@ A minimal simulation laboratory for exploring bistable workspace dynamics, self-
 
 miniBrain provides a compact, interactive environment to experiment with three related recurrent dynamics models:
 - **Option A**: Bistable units with a global workspace coupling.
-- **Option B**: Reflective hierarchical "why-loop" architecture.
+- **Option B**: Hierarchical reflective architecture.
 - **Option C**: Self-referential workspace that maintains and predicts a compressed self-model.
 
 The lab includes background autotuning (meta-tuner NN), perturbations to maintain entropy, and instrumentation for complexity metrics (Shannon entropy, Lyapunov proxy, Lempel-Ziv complexity, mutual information).
