@@ -1,0 +1,110 @@
+% findings.tex
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\title{Autotuning and Self-Referential Dynamics in a Minimal Bistable Workspace} 
+\author{Brandon Raeder et al.}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present a compact software environment (``lab.py'') for experimenting with three recurrent dynamical architectures: (A) a bistable network modulated by a global workspace signal, (B) a hierarchical reflective architecture, and (C) a self-referential workspace that predicts and modulates its own compressed state representation. A lightweight meta-autotuning process proposes parameter updates (gain $\alpha$ and workspace coupling $\epsilon$) using a small neural meta-tuner and rollout-based causal reward. To maintain rich dynamics and prevent resonance lock-in, we introduce a dual-frequency perturbation with slow drift. The system includes instrumentation for entropy, a Lyapunov proxy, a Lempel–Ziv ...
+\end{abstract}
+
+\section{Introduction}
+Understanding how global coupling and self-modeling interact with bistable local dynamics is relevant for exploring mechanisms of coherent processing, surprise, and meta-level regulation in minimal neural systems. To this end we developed \texttt{lab.py}, a lightweight and reproducible environment supporting rapid iteration, interactive visualization, automated smoke tests, and parameter autotuning guided by complexity-based reward.
+
+\section{Methods}
+\subsection{Model Variants}
+We implemented three configurations:
+\begin{itemize}
+  \item \textbf{Option A}: $N$ bistable units with a global workspace variable $ws$ that integrates mean population activity and feeds back with strength $\epsilon$.
+  \item \textbf{Option B}: Two coupled bistable cascades with an additional reflective ``why'' unit driving workspace activity through a saturating map.
+  \item \textbf{Option C}: A self-referential workspace maintaining a compressed self-model vector (mean, variance, trend, normalized workspace, short-term entropy, coherence) along with a small predictor that forecasts future self-model values. Prediction error modulates local dynamics.
+\end{itemize}
+
+All models use $\tanh(\alpha x - \theta)$ as the bistable activation and Euler integration with timestep $dt$.
+
+\subsection{Autotuning}
+A small PyTorch network maps complexity features $[\mathrm{entropy}, R, \mathrm{lyap}, \mathrm{complexity}]$ to normalized parameters $[\hat\alpha, \hat\epsilon]$. Background workers:
+\begin{enumerate}
+  \item Propose candidate parameters and run short rollouts.
+  \item Compute reward: $\mathrm{reward} = w_{H}\cdot H + w_{R}\cdot R_{\text{final}}$.
+  \item Store $(\text{features}, \text{params}, \text{reward})$ in an experience buffer and update the meta-tuner by reward-weighted regression.
+\end{enumerate}
+A fallback heuristic based on entropy is used if PyTorch is unavailable.
+
+\subsection{Irrational-Time Perturbation}
+To prevent resonance lock-in, low-amplitude sinusoidal perturbations at two incommensurate periods ($\tau_1, \tau_2$) are introduced with a slow phase drift.
+
+\section{Implementation Notes}
+The codebase is contained in a single script (\texttt{lab.py}) plus a helper file for self-model utilities.
+\begin{itemize}
+  \item \textbf{GUI}: A 3×2 layout provides workspace heatmaps and phase traces with rolling-window views.
+  \item \textbf{Threading}: Autotuning threads are started only after Matplotlib animations are active to avoid Tk race conditions.
+  \item \textbf{Metrics}: Shannon entropy, Lyapunov-step proxy, LZ-76 complexity on thresholded traces, pairwise mutual information, and simple linear decoders.
+  \item \textbf{Testing}: \texttt{smoke\_test\_autotune()} validates background worker updates and buffer behavior.
+\end{itemize}
+
+\section{Results}
+Preliminary runs indicate:
+\begin{itemize}
+  \item The experience buffer is actively populated and updates the meta-tuner toward higher-entropy regimes.
+  \item The dual-frequency perturbation reduces overly persistent oscillatory modes relative to single-frequency perturbation.
+  \item Deferring autotune thread initialization until after GUI setup prevents Tk/Tcl instability.
+\end{itemize}
+
+\begin{table}[ht]
+\centering
+\caption{Example metrics from a short 500-step run (illustrative only).}
+\begin{tabular}{lrrrr}
+\toprule
+Model & Mean $R$ & Entropy & Lyap Proxy & Reward \\
+\midrule
+Option A & 0.12 & 1.97 & 0.032 & 0.45 \\
+Option B & 0.08 & 2.14 & 0.041 & 0.62 \\
+Option C & 0.20 & 2.35 & 0.029 & 0.71 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Discussion}
+Short rollouts combined with a reward-weighted experience buffer provide an effective causal training signal for parameter tuning. Option C introduces a self-modeling signal via prediction error, adding a channel for dynamic self-regulation. Metrics remain proxy-based and require further validation across longer runs and broader parameter sweeps.
+
+\section{Reproducibility}
+Dependencies: Python 3.10+, NumPy, Matplotlib, scikit-learn, PyTorch (optional).
+
+\begin{verbatim}
+# GUI (interactive)
+python3 lab.py
+
+# Headless smoke test
+python3 -c "import matplotlib; matplotlib.use('Agg'); \
+             import lab; lab.smoke_test_autotune(2.0)"
+\end{verbatim}
+
+\section{Conclusion}
+This environment offers a compact platform for exploring workspace-mediated dynamics, self-modeling, and automatic parameter adjustment. Its minimal footprint is intended to encourage experimentation and modification.
+
+\section*{Acknowledgements}
+Development and testing were performed by the project team. Code is available at:
+\texttt{https://github.com/BrandonRaeder/miniBrain}
+
+\begin{thebibliography}{9}
+\bibitem{tononi2008}
+G. Tononi, \emph{Consciousness as Integrated Information}, Biological Bulletin, 2008.
+
+\bibitem{wolpert1995}
+D. Wolpert, Z. Ghahramani, M. Jordan, \emph{An internal model for sensorimotor integration}, 1995.
+\end{thebibliography}
+
+\end{document}
