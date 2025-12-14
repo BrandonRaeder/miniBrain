@@ -250,8 +250,10 @@ def bistable_layer(x, alpha, theta_eff):
 
 def update_bistable_np(x, input_val, tau, anti_converge, dt, perturb_phase):
     """NumPy port from miniBrain.tsx updateBistable for Model C"""
+    n = len(x)
+    phases = perturb_phase + np.arange(n) * 0.13
     bistable = x * (1 - x * x)
-    anti_term = anti_converge * np.sin(x * 7.3 + perturb_phase)
+    anti_term = anti_converge * np.sin(x * 9.3 + phases)
     dx = (-x / tau) + bistable + input_val + anti_term
     return np.tanh(x + dx * dt)
 
@@ -1068,7 +1070,10 @@ class MetaOptimizer:
         return params
 
     def update(self, metrics_data, params):
-        score = metrics_data['entropy'] * metrics_data['coherence']
+        coherence = metrics_data['coherence']
+        # Shape coherence reward to peak at ~0.99 for edge-of-chaos
+        coherence_shaped = coherence * np.exp( -((coherence - 0.99)/0.01)**2 )
+        score = metrics_data['entropy'] * coherence_shaped
         self.buffer.append({'metrics': metrics_data, 'params': params, 'score': score})
 
         if score > self.best_score:
@@ -1115,7 +1120,8 @@ def _update_dynamics_c(state, n_layers, dt, alpha, eps, theta_eff, k_ws):
     perturbation = params['perturbation']
     self_weight = params['selfWeight']
     last_R = state['R_hist'][-1] if len(state['R_hist']) > 0 else 0.0
-    anti_converge = 0.05 + 1.2 * np.exp(20 * (last_R - 0.98))
+    anti_converge_base = 0.1 + 2.0 * np.exp(40 * (last_R - 0.98))
+    anti_converge = anti_converge_base * state.get('anti_mult', 1.0)
     state['perturb_phase'] += np.pi / 100
     if state['step_count'] > 0 and state['step_count'] % int(100 * np.e) == 0:
         perturb_val = np.sin(np.arange(n_layers) * np.pi + state['step_count'] * 0.01) * perturbation * 1.5
@@ -1126,8 +1132,9 @@ def _update_dynamics_c(state, n_layers, dt, alpha, eps, theta_eff, k_ws):
     
     x_for_var = state['x'].cpu().numpy() if (HAVE_TORCH and isinstance(state['x'], torch.Tensor)) else state['x']
     variance = np.var(x_for_var)
-    if variance < 0.3 or last_R > 0.97:
-        noise_val = (np.random.rand(n_layers) - 0.5) * 0.3 * np.sin(np.arange(n_layers) * 2.1 + state['perturb_phase'])
+    if variance < 0.4 or last_R > 0.95:
+        noise_base = 0.4 * np.sin(np.arange(n_layers) * 2.1 + state['perturb_phase'])
+        noise_val = (np.random.rand(n_layers) - 0.5) * noise_base * state.get('noise_mult', 1.0)
         if HAVE_TORCH and isinstance(state['x'], torch.Tensor):
             state['x'] += torch.tensor(noise_val, device=device, dtype=state['x'].dtype)
         else:
@@ -1170,8 +1177,9 @@ def _update_dynamics_c(state, n_layers, dt, alpha, eps, theta_eff, k_ws):
         noise = (torch.rand(n_layers, device=device) - 0.5) * perturbation
         input_val = torch.tensor(pred_error, device=device, dtype=torch.float32) + ws_coupling + lateral + noise
         
+        phases_x = state['perturb_phase'] + torch.arange(n_layers, device=device) * 0.13
         bistable = state['x'] * (1 - state['x'] * state['x'])
-        anti_term = anti_converge * torch.sin(state['x'] * 7.3 + state['perturb_phase'])
+        anti_term = anti_converge * torch.sin(state['x'] * 9.3 + phases_x)
         dx = (-state['x'] / tau) + bistable + input_val + anti_term
         state['x'] = torch.tanh(state['x'] + dx * dt)
 
@@ -1211,11 +1219,11 @@ def _update_dynamics_c(state, n_layers, dt, alpha, eps, theta_eff, k_ws):
 
 def _update_dynamics_d(state, n_layers, dt, alpha, eps, theta_eff, k_ws):
     # Hybrid model: Reflective Hierarchy + Self-Referential Workspace from miniBrain.tsx
-    params = state.get('params', {'tau': 0.1, 'coupling': 0.5, 'perturbation': 0.05, 'selfWeight': 0.3, 'antiConvergence': 0.02})
+    params = state.get('params', {'tau': 0.1, 'coupling': 0.5, 'perturbation': 0.10, 'selfWeight': 0.2, 'antiConvergence': 0.08})
     tau, coupling, perturbation, self_weight, anti_converge = params['tau'], params['coupling'], params['perturbation'], params['selfWeight'], params['antiConvergence']
 
     last_R = state['R_hist'][-1] if len(state['R_hist']) > 0 else 0.0
-    anti_converge = 0.05 + 0.5 * last_R**10
+    anti_converge = 0.30 + 2.0 * last_R**2.5
 
     state['perturb_phase'] += np.pi / 100
     state['why'] = why_loop_driver(state['why'], 1.2)
@@ -1238,7 +1246,7 @@ def _update_dynamics_d(state, n_layers, dt, alpha, eps, theta_eff, k_ws):
 
     combined_np = combined_state.cpu().numpy() if (HAVE_TORCH and isinstance(combined_state, torch.Tensor)) else combined_state
     
-    if np.var(combined_np) < 0.3 or last_R > 0.98:
+    if np.var(combined_np) < 0.3 or last_R > 0.97:
         noise_val = (np.random.rand(n_layers) - 0.5) * 0.2 * np.sin(np.arange(n_layers) * 2.1 + state['perturb_phase'])
         if HAVE_TORCH and isinstance(state['x'], torch.Tensor):
             n_val = torch.tensor(noise_val, device=device, dtype=state['x'].dtype)
@@ -1270,17 +1278,27 @@ def _update_dynamics_d(state, n_layers, dt, alpha, eps, theta_eff, k_ws):
     
     ws_coupling = state['ws'] * 0.25
     why_mod = 0.2 * (state['why'].item() if HAVE_TORCH and isinstance(state['why'], torch.Tensor) else state['why'])
+    # Additional anti-sync noise every step
+    sync_noise_base = 0.05 * np.sin(np.arange(n_layers) * 3.14 + state['perturb_phase']) * (1.0 - last_R)
+    sync_noise = sync_noise_base * state.get('noise_mult', 1.0)
+    if HAVE_TORCH and isinstance(state['x'], torch.Tensor):
+        sync_noise_t = torch.tensor(sync_noise, device=device, dtype=state['x'].dtype)
+        state['x'] += sync_noise_t
+        state['y'] += sync_noise_t
+    else:
+        state['x'] += sync_noise
+        state['y'] += sync_noise
 
     if HAVE_TORCH and isinstance(state['x'], torch.Tensor):
         pred_error_x = (prediction - state['x'].cpu().numpy()) * self_weight
         pred_error_y = (prediction - state['y'].cpu().numpy()) * self_weight
 
-        lateral_x = torch.roll(state['x'], shifts=-3, dims=0) * -0.08
-        noise_x = (torch.rand(n_layers, device=device) - 0.5) * perturbation
+        lateral_x = (torch.roll(state['x'], shifts=-5, dims=0) * -0.20 + torch.roll(state['x'], shifts=5, dims=0) * -0.10)
+        noise_x = (torch.rand(n_layers, device=device) - 0.5) * perturbation * (1.5 + 5.0 * torch.tensor(last_R).to(device))
         input_val_x = torch.tensor(pred_error_x, device=device, dtype=torch.float32) + ws_coupling + lateral_x + noise_x + why_mod
 
-        lateral_y = torch.roll(state['y'], shifts=-3, dims=0) * -0.08
-        noise_y = (torch.rand(n_layers, device=device) - 0.5) * perturbation
+        lateral_y = (torch.roll(state['y'], shifts=-5, dims=0) * -0.20 + torch.roll(state['y'], shifts=5, dims=0) * -0.10)
+        noise_y = (torch.rand(n_layers, device=device) - 0.5) * perturbation * (1.5 + 5.0 * torch.tensor(last_R).to(device))
         input_val_y = torch.tensor(pred_error_y, device=device, dtype=torch.float32) + ws_coupling + lateral_y + noise_y - why_mod
 
         # Update x
@@ -1290,8 +1308,9 @@ def _update_dynamics_d(state, n_layers, dt, alpha, eps, theta_eff, k_ws):
         state['x'] = torch.tanh(state['x'] + dx * dt)
         
         # Update y
+        phases_y = state['perturb_phase'] + torch.arange(n_layers, device=device) * 0.13
         bistable_y = state['y'] * (1 - state['y'] * state['y'])
-        anti_term_y = anti_converge * torch.sin(state['y'] * 7.3 + state['perturb_phase'])
+        anti_term_y = anti_converge * torch.sin(state['y'] * 9.3 + phases_y)
         dy = (-state['y'] / tau) + bistable_y + input_val_y + anti_term_y
         state['y'] = torch.tanh(state['y'] + dy * dt)
 
@@ -1302,12 +1321,12 @@ def _update_dynamics_d(state, n_layers, dt, alpha, eps, theta_eff, k_ws):
         pred_error_x = (prediction - state['x']) * self_weight
         pred_error_y = (prediction - state['y']) * self_weight
 
-        lateral_x = np.roll(state['x'], shift=-3) * -0.08
-        noise_x = (np.random.rand(n_layers) - 0.5) * perturbation
+        lateral_x = (np.roll(state['x'], shift=-5) * -0.20 + np.roll(state['x'], shift=5) * -0.10)
+        noise_x = (np.random.rand(n_layers) - 0.5) * perturbation * (1.5 + 5.0 * last_R)
         input_val_x = pred_error_x + ws_coupling + lateral_x + noise_x + why_mod
 
-        lateral_y = np.roll(state['y'], shift=-3) * -0.08
-        noise_y = (np.random.rand(n_layers) - 0.5) * perturbation
+        lateral_y = (np.roll(state['y'], shift=-5) * -0.20 + np.roll(state['y'], shift=5) * -0.10)
+        noise_y = (np.random.rand(n_layers) - 0.5) * perturbation * (1.5 + 5.0 * last_R)
         input_val_y = pred_error_y + ws_coupling + lateral_y + noise_y - why_mod
 
         state['x'] = update_bistable_np(state['x'], input_val_x, tau, anti_converge, dt, state['perturb_phase'])
@@ -1614,7 +1633,8 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
         # --- Update Model C ---
         curr_alpha_c = state_c['alpha']
         curr_eps_c = state_c['eps']
-        R_c, x_c = _update_dynamics_c(state_c, n_layers, dt, curr_alpha_c, curr_eps_c, theta_eff, k_ws)
+        R_raw_c, x_c = _update_dynamics_c(state_c, n_layers, dt, curr_alpha_c, curr_eps_c, theta_eff, k_ws)
+        R_c = R_raw_c
         state_c['R_hist'].append(R_c)
         state_c['x_history'][:, state_c['step_count'] % REDUCED_HISTORY_SIZE] = x_c
         heatmap_c.set_data(state_c['x_history'])
@@ -1646,7 +1666,8 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
         # --- Update Model D ---
         curr_alpha_d = state_d['alpha']
         curr_eps_d = state_d['eps']
-        R_d, combined_d = _update_dynamics_d(state_d, n_layers, dt, curr_alpha_d, curr_eps_d, theta_eff, k_ws)
+        R_raw_d, combined_d = _update_dynamics_d(state_d, n_layers, dt, curr_alpha_d, curr_eps_d, theta_eff, k_ws)
+        R_d = R_raw_d
         state_d['R_hist'].append(R_d)
         state_d['combined_history'][:, state_d['step_count'] % REDUCED_HISTORY_SIZE] = combined_d
         heatmap_d.set_data(state_d['combined_history'])
@@ -1741,18 +1762,42 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
         )
 
         # Update stability status
-        if len(state_c['self_error_hist']) > 50:
-            std_dev = np.std(list(state_c['self_error_hist'])[-50:])
-            if std_dev < 0.01:
+        if len(state_c['self_error_hist']) > 50 and len(state_c['R_hist']) > 50:
+            recent_self_errors = np.array(list(state_c['self_error_hist'])[-50:])
+            mean_self_error = np.mean(recent_self_errors)
+            std_self_error = np.std(recent_self_errors)
+            current_self_error = state_c['self_error_hist'][-1]
+
+            recent_coherence = np.array(list(state_c['R_hist'])[-50:])
+            mean_coherence = np.mean(recent_coherence)
+            std_coherence = np.std(recent_coherence)
+            current_coherence = state_c['R_hist'][-1]
+
+            error_is_stable = abs(current_self_error - mean_self_error) <= std_self_error
+            coherence_is_stable = abs(current_coherence - mean_coherence) <= std_coherence
+
+            if error_is_stable and coherence_is_stable:
                 stability_text_c.set_text("Stabilized")
                 stability_text_c.set_color('green')
             else:
                 stability_text_c.set_text("Unstable")
                 stability_text_c.set_color('red')
         
-        if len(state_d['self_error_hist']) > 50:
-            std_dev = np.std(list(state_d['self_error_hist'])[-50:])
-            if std_dev < 0.01:
+        if len(state_d['self_error_hist']) > 50 and len(state_d['R_hist']) > 50:
+            recent_self_errors = np.array(list(state_d['self_error_hist'])[-50:])
+            mean_self_error = np.mean(recent_self_errors)
+            std_self_error = np.std(recent_self_errors)
+            current_self_error = state_d['self_error_hist'][-1]
+
+            recent_coherence = np.array(list(state_d['R_hist'])[-50:])
+            mean_coherence = np.mean(recent_coherence)
+            std_coherence = np.std(recent_coherence)
+            current_coherence = state_d['R_hist'][-1]
+
+            error_is_stable = abs(current_self_error - mean_self_error) <= std_self_error
+            coherence_is_stable = abs(current_coherence - mean_coherence) <= std_coherence
+
+            if error_is_stable and coherence_is_stable:
                 stability_text_d.set_text("Stabilized")
                 stability_text_d.set_color('green')
             else:
@@ -1959,8 +2004,22 @@ if HAVE_TORCH:
                 nn.ReLU(),
                 nn.Linear(16, 8),
                 nn.ReLU(),
-                nn.Linear(8, 2),
-                nn.Sigmoid() # outputs in [0,1]
+                nn.Linear(8, 4),  # alpha, eps, anti_mult, noise_mult
+                nn.Sigmoid()
+            )
+        def forward(self, x):
+            return self.net(x)
+
+    class AntiSyncTuner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(3, 12),  # r, entropy, var
+                nn.ReLU(),
+                nn.Linear(12, 8),
+                nn.ReLU(),
+                nn.Linear(8, 2),  # anti_mult [0.5-2.0], noise_mult [0.5-2.0]
+                nn.Sigmoid()
             )
         def forward(self, x):
             return self.net(x)
@@ -2080,11 +2139,19 @@ def _autotune_worker(states, stop_event, interval=1.0, retrain_every=20):
                 lyap = lyapunov_proxy(R_hist)
                 complexity = entropy + lyap
                 if HAVE_TORCH and 'meta_tuner' in state:
-                    alpha_s, eps_s = meta_autotune_update(state['meta_tuner'], entropy, r, lyap, complexity)
+                    out = state['meta_tuner'](torch.tensor([entropy, r, lyap, complexity], dtype=torch.float32))
+                    alpha_s = ALPHA_MIN + (ALPHA_MAX - ALPHA_MIN) * out[0].item()
+                    eps_s = EPS_MIN + (EPS_MAX - EPS_MIN) * out[1].item()
+                    anti_mult = 0.5 + 1.5 * out[2].item()  # [0.5,2.0]
+                    noise_mult = 0.5 + 1.5 * out[3].item()
                 else:
                     alpha_s, eps_s = meta_autotune_update(entropy, r, lyap, complexity)
+                    anti_mult = 1.2
+                    noise_mult = 1.2
                 state['alpha'] = alpha_s
                 state['eps'] = eps_s
+                state['anti_mult'] = anti_mult
+                state['noise_mult'] = noise_mult
                 if 'complexity_events' in state:
                     state['complexity_events'].append(state['step_count'])
             except Exception:
@@ -2189,7 +2256,9 @@ def _estimate_rollout_reward(state, alpha_s, eps_s, steps=10, dt=0.01):
     # compute entropy over rollout R values
     entropy = shannon_entropy(R_arr)
     final_r = float(R_arr[-1]) if len(R_arr) > 0 else 0.0
-    reward = REWARD_W_ENTROPY * entropy + REWARD_W_R * final_r
+    # Shape R reward to peak at ~0.99 for edge-of-chaos
+    r_shaped = final_r * np.exp( -((final_r - 0.99)/0.01)**2 )
+    reward = REWARD_W_ENTROPY * entropy + REWARD_W_R * r_shaped
     return float(reward)
     
     # sleep until next cycle handled in _autotune_worker
@@ -2262,7 +2331,7 @@ def train_meta_tuner_batch(tuner, optimizer, experience, batch_size=64, n_epochs
 
     for ep in range(n_epochs):
         opt.zero_grad()
-        pred = tuner(X_t)
+        pred = tuner(X_t)[:, :2]  # Train only alpha/eps outputs (first 2)
         loss_mat = loss_fn(pred, Y_t)
         # apply weights
         loss = (loss_mat * W_t).mean()
