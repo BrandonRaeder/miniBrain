@@ -1,9 +1,15 @@
+def create_meta_tuner_and_optimizer():
+    """Utility to always create a new MetaTunerNN and matching Adam optimizer."""
+    model = MetaTunerNN()
+    optimizer = optim.Adam(model.parameters(), lr=0.05)
+    return model, optimizer
 import time
 script_start_time = time.time()
 print(f"[{time.time() - script_start_time:.4f}s] Script execution started.")
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
+import copy
 try:
     matplotlib.use('Qt5Agg')
 except ImportError:
@@ -14,6 +20,7 @@ except ImportError:
 from matplotlib.animation import FuncAnimation
 try:
     import torch
+    torch.autograd.set_detect_anomaly(True)
     import torch.nn as nn
     import torch.optim as optim
     HAVE_TORCH = True
@@ -32,9 +39,9 @@ try:
         ipex = None # Initialize ipex to None
         try:
             import intel_extension_for_pytorch as ipex
-            HAVE_IPEX = True # Set HAVE_IPEX to True if import succeeds
         except ImportError:
-            pass # ipex remains None if import fails
+            ipex = None
+        HAVE_IPEX = ipex is not None
 
         if HAVE_IPEX and torch.xpu.is_available(): # Guard with HAVE_IPEX
             device = torch.device('xpu')
@@ -138,6 +145,57 @@ class OptimizedMetrics:
             return 0.0
         diffs = np.abs(np.diff(data))
         return np.mean(diffs)
+
+    def cached_self_r2(self, self_model_hist, key_suffix=""):
+        """Self-model predictability R² proxy (shift or stored preds)"""
+        if not ENABLE_CACHING or len(self_model_hist) < 10:
+            return self._compute_self_r2_fast(self_model_hist)
+        
+        key = f"r2_{len(self_model_hist)}_{hash(str(np.mean(self_model_hist[-5:],axis=0)))}_{key_suffix}"
+        if key in self.entropy_cache:  # Reuse entropy cache
+            return self.entropy_cache[key]
+        
+        result = self._compute_self_r2_fast(self_model_hist)
+        self.entropy_cache[key] = result  # Reuse cache
+        
+        if len(self.entropy_cache) > CACHE_SIZE:
+            self.entropy_cache.clear()
+            
+        return result
+    
+    def _compute_self_r2_fast(self, self_model_hist):
+        """R² of self-model auto-regression (naive shift pred)"""
+        if len(self_model_hist) < 5:
+            return 0.0
+        recent = np.array(self_model_hist[-20:])
+        y_true = recent[1:]
+        y_pred = recent[:-1]  # Shift-1 "prediction"
+        if np.ptp(y_true, axis=0).max() < 1e-6:
+            return 1.0
+        return r2_score(y_true, y_pred, multioutput='uniform_average')
+    
+    def self_awareness_score(self, neurons_hist, self_model_hist):
+        """Self-awareness metric: MSE between neurons and self-model prediction (miniBrain.tsx style)"""
+        if len(neurons_hist) < 10 or len(self_model_hist) < 10:
+            return 0.0
+        # Use last 20 steps for awareness
+        neurons_arr = np.array(neurons_hist[-20:])
+        self_model_arr = np.array(self_model_hist[-20:])
+        # Broadcast self_model to neuron shape if needed
+        if self_model_arr.ndim == 2 and neurons_arr.ndim == 2:
+            # For each step, expand self_model to neuron count
+            mse_list = []
+            for n, m in zip(neurons_arr, self_model_arr):
+                # Repeat/expand m to n's shape
+                m_exp = np.repeat(m, len(n)//len(m)) if len(m) < len(n) else m[:len(n)]
+                mse = np.mean((n - m_exp) ** 2)
+                mse_list.append(mse)
+            mean_mse = np.mean(mse_list)
+        else:
+            mean_mse = np.mean((neurons_arr - self_model_arr) ** 2)
+        # Awareness is inverse of MSE (higher is better)
+        awareness = 1.0 / (1.0 + mean_mse)
+        return awareness
     
 
 # Fast LZ complexity
@@ -173,7 +231,7 @@ def phi_proxy(x, bins=32):
         effectiveInfo += shannon_entropy(local_data, bins=8)
     effectiveInfo /= min(N, 32)
     coherence = np.abs(np.mean(np.exp(1j * x)))
-    phi = mutualInfo * effectiveInfo * (1 + coherence) * N * 0.12
+    phi = mutualInfo * effectiveInfo * (1 + coherence) * N * 0.2
     return max(0.0, phi)
 
 
@@ -270,7 +328,7 @@ def why_loop_driver(y, gamma):
         return _why_loop_driver_numpy_jit(y, gamma)  # reflective recursion term
 
 # ---------- Option A: with global workspace ----------
-def simulate_workspace(n_layers=100, T=1000, dt=0.01,
+def simulate_workspace(n_layers=500, T=1000, dt=0.01,
                         alpha=0.8, eps=0.7, theta_eff=0.3, k_ws=0.05):
     if HAVE_TORCH:
         x = torch.randn(n_layers, device=device)
@@ -499,7 +557,7 @@ def simulate_self_referential_reflective_hierarchy(T=1000, dt=0.01,
         return np.array(R_hist), np.array(ws_hist), np.array(self_error_hist), np.array(self_model_hist)
 
 # ---------- Option C: Self-Referential Workspace (step-simulated version) ----------
-def simulate_self_referential_workspace(n_layers=100, T=1000, dt=0.01,
+def simulate_self_referential_workspace(n_layers=500, T=1000, dt=0.01,
                                         alpha=0.8, eps=0.7, theta_eff=0.3, k_ws=0.05,
                                         meta_learning_rate=0.01):
     if HAVE_TORCH:
@@ -534,12 +592,16 @@ def simulate_self_referential_workspace(n_layers=100, T=1000, dt=0.01,
 
             complexity_metrics = {'entropy': entropy, 'coherence': coherence.item()}
 
-            # encode simple self-model
-            mean_activity = torch.mean(x).item()
-            std_activity = torch.std(x).item()
-            trend = np.mean(np.diff(R_hist[-10:])) if len(R_hist) > 10 else 0.0
-            ws_normalized = torch.tanh(ws).item()
-            self_model = np.array([mean_activity, std_activity, trend, ws_normalized, entropy, coherence.item()])
+            # Moving average self-model update (miniBrain.tsx style)
+            M = len(self_model)
+            x_np = x.cpu().numpy() if hasattr(x, 'cpu') else x
+            new_self_model = np.zeros_like(self_model)
+            for i in range(M):
+                start = (i * len(x_np)) // M
+                end = ((i + 1) * len(x_np)) // M
+                avg = np.mean(x_np[start:end])
+                new_self_model[i] = self_model[i] * 0.75 + avg * 0.25
+            self_model = new_self_model
 
             # predict own future (predictor not trained here)
             if predictor is not None:
@@ -586,12 +648,16 @@ def simulate_self_referential_workspace(n_layers=100, T=1000, dt=0.01,
 
             complexity_metrics = {'entropy': entropy, 'coherence': coherence}
 
-            # encode simple self-model
-            mean_activity = np.mean(x)
-            std_activity = np.std(x)
-            trend = np.mean(np.diff(R_hist[-10:])) if len(R_hist) > 10 else 0.0
-            ws_normalized = np.tanh(ws)
-            self_model = np.array([mean_activity, std_activity, trend, ws_normalized, entropy, coherence])
+            # Moving average self-model update (miniBrain.tsx style)
+            M = len(self_model)
+            x_np = x
+            new_self_model = np.zeros_like(self_model)
+            for i in range(M):
+                start = (i * len(x_np)) // M
+                end = ((i + 1) * len(x_np)) // M
+                avg = np.mean(x_np[start:end])
+                new_self_model[i] = self_model[i] * 0.75 + avg * 0.25
+            self_model = new_self_model
 
             # predict own future (predictor not trained here)
             if predictor is not None:
@@ -608,7 +674,7 @@ def simulate_self_referential_workspace(n_layers=100, T=1000, dt=0.01,
         return np.array(R_hist), np.array(ws_hist), np.array(x_hist), np.array(self_error_hist), np.array(self_model_hist)
 
 # ---------- Real-time heatmap animation ----------
-def animate_workspace_heatmap(n_layers=100, T=1000, dt=0.01,
+def animate_workspace_heatmap(n_layers=500, T=1000, dt=0.01,
                               alpha=0.8, eps=0.7, theta_eff=0.3, k_ws=0.05):
     R_hist, ws_hist, x_hist = simulate_workspace(n_layers, T, dt, alpha, eps, theta_eff, k_ws)
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6))
@@ -631,7 +697,7 @@ def animate_workspace_heatmap(n_layers=100, T=1000, dt=0.01,
     plt.show()
 
 # ---------- Real-time parameter sweep animation ----------
-def animate_parameter_sweep(n_layers=100, T=500, dt=0.01,
+def animate_parameter_sweep(n_layers=500, T=500, dt=0.01,
                            alpha_range=(0.5, 1.2), eps_range=(0.3, 1.0),
                            theta_eff=0.3, k_ws=0.05, n_alpha=5, n_eps=5):
     alphas = np.linspace(*alpha_range, n_alpha)
@@ -705,13 +771,18 @@ def _update_dynamics_c(state, n_layers, dt, alpha, eps, theta_eff, k_ws):
     predictor = state.get('predictor', None)
     predicted_self = state.get('predicted_self', np.zeros(6))
     self_model = state.get('self_model', np.zeros(6))
+    # Pad self_model to shape (8,) if needed
+    if self_model.shape[0] < 8:
+        self_model = np.pad(self_model, (0, 8 - self_model.shape[0]))
+    if predicted_self.shape[0] < 8:
+        predicted_self = np.pad(predicted_self, (0, 8 - predicted_self.shape[0]))
     self_error = np.linalg.norm(predicted_self - self_model)
     self_awareness = 0.01 * self_error * (self_model[0] if self_model.size>0 else 0.0)
     state['self_error_hist'].append(self_error)
 
     if HAVE_TORCH and isinstance(state['x'], torch.Tensor):
         dx_c = -state['x'] + bistable_layer(state['x'], alpha, theta_eff) + eps * state['ws'] + self_awareness + 0.03 * torch.randn(n_layers, device=device)
-        state['x'] += dt * dx_c
+        state['x'] = state['x'] + dt * dx_c
         state['ws'] = (1 - k_ws) * state['ws'] + k_ws * torch.mean(state['x'])
         R_c = torch.mean(torch.exp(1j * state['x'])).real.item()
         # encode self_model (simple)
@@ -732,7 +803,7 @@ def _update_dynamics_c(state, n_layers, dt, alpha, eps, theta_eff, k_ws):
         return R_c, state['x'].cpu().numpy()
     else:
         dx_c = -state['x'] + bistable_layer(state['x'], alpha, theta_eff) + eps * state['ws'] + self_awareness + 0.03 * np.random.randn(n_layers)
-        state['x'] += dt * dx_c
+        state['x'] = state['x'] + dt * dx_c
         state['ws'] = (1 - k_ws) * state['ws'] + k_ws * np.mean(state['x'])
         R_c = np.mean(np.exp(1j * state['x'])).real
         # encode self_model (simple)
@@ -765,14 +836,14 @@ def _update_dynamics_d(state, n_layers, dt, alpha, eps, theta_eff, k_ws):
         dx_d = -state['x'] + bistable_layer(state['x'], alpha, theta_eff + 0.2 * state['why']) + self_awareness_d
         dy_d = -state['y'] + bistable_layer(state['y'], alpha, theta_eff - 0.2 * state['why']) + self_awareness_d
         noise = 0.03 * torch.randn(n_layers, device=device)
-        dx_d += noise
-        dy_d += noise
+        dx_d = dx_d + noise
+        dy_d = dy_d + noise
         combined_d = (state['x'] + state['y']) / 2.0
-        state['x'] += dt * dx_d
-        state['y'] += dt * dy_d
+        state['x'] = state['x'] + dt * dx_d
+        state['y'] = state['y'] + dt * dy_d
         state['ws'] = (1 - k_ws) * state['ws'] + k_ws * torch.mean(combined_d)
-        state['x'] += eps * state['ws'] * dt
-        state['y'] += eps * state['ws'] * dt
+        state['x'] = state['x'] + eps * state['ws'] * dt
+        state['y'] = state['y'] + eps * state['ws'] * dt
         R_d = torch.mean(torch.exp(1j * combined_d)).real.item()
         mean_x_d = torch.mean(state['x']).item()
         std_x_d = torch.std(state['x']).item()
@@ -795,14 +866,14 @@ def _update_dynamics_d(state, n_layers, dt, alpha, eps, theta_eff, k_ws):
         dx_d = -state['x'] + bistable_layer(state['x'], alpha, theta_eff + 0.2 * state['why']) + self_awareness_d
         dy_d = -state['y'] + bistable_layer(state['y'], alpha, theta_eff - 0.2 * state['why']) + self_awareness_d
         noise = 0.03 * np.random.randn(n_layers)
-        dx_d += noise
-        dy_d += noise
+        dx_d = dx_d + noise
+        dy_d = dy_d + noise
         combined_d = (state['x'] + state['y']) / 2.0
-        state['x'] += dt * dx_d
-        state['y'] += dt * dy_d
+        state['x'] = state['x'] + dt * dx_d
+        state['y'] = state['y'] + dt * dy_d
         state['ws'] = (1 - k_ws) * state['ws'] + k_ws * np.mean(combined_d)
-        state['x'] += eps * state['ws'] * dt
-        state['y'] += eps * state['ws'] * dt
+        state['x'] = state['x'] + eps * state['ws'] * dt
+        state['y'] = state['y'] + eps * state['ws'] * dt
         R_d = np.mean(np.exp(1j * combined_d)).real
         mean_x_d = np.mean(state['x'])
         std_x_d = np.std(state['x'])
@@ -1211,6 +1282,11 @@ def _update_dynamics_c(state, n_layers, dt, alpha, eps, theta_eff, k_ws):
     # This seems to be the intention of the original code.
     state['self_model_for_error'] = current_self_model
     predicted_self = state.get('predicted_self', np.zeros(6))
+    # Ensure both arrays are shape (8,)
+    if predicted_self.shape[0] < 8:
+        predicted_self = np.pad(predicted_self, (0, 8 - predicted_self.shape[0]))
+    if current_self_model.shape[0] < 8:
+        current_self_model = np.pad(current_self_model, (0, 8 - current_self_model.shape[0]))
     self_error = np.linalg.norm(predicted_self - current_self_model)
     state['self_error_hist'].append(self_error)
 
@@ -1356,14 +1432,143 @@ def _update_dynamics_d(state, n_layers, dt, alpha, eps, theta_eff, k_ws):
 
     return R_d, d_np
 
+def _update_dynamics_e(state, n_layers, dt, alpha, eps, theta_eff, k_ws):
+    '''Model E: Self-Aware - D + awareness modulation (torch fixed)'''
+    R_d, combined_np = _update_dynamics_d(state, n_layers, dt, alpha, eps, theta_eff, k_ws)
+
+    awareness = 0.0
+    if len(state['self_error_hist']) >= 20:
+        # Awareness score: normalized inverse of recent self-error std
+        recent_self_error = np.array(list(state['self_error_hist'])[-20:])
+        std_self_error = np.std(recent_self_error)
+        awareness = max(0.0, 1.0 - std_self_error / 0.1)  # 0.1 is a tunable threshold
+
+    pert_strength = 0.05 * awareness
+    awareness_pert = pert_strength * np.sin(np.arange(n_layers) * 0.2 + state['perturb_phase'])
+
+    if HAVE_TORCH and isinstance(state['x'], torch.Tensor):
+        pert_t = torch.tensor(awareness_pert, dtype=state['x'].dtype, device=state['x'].device if hasattr(state['x'], 'device') else device)
+        # Avoid in-place modification
+        state['x'] = state['x'] + pert_t
+        state['y'] = state['y'] + pert_t
+    else:
+        state['x'] = state['x'] + awareness_pert
+        state['y'] = state['y'] + awareness_pert
+
+    combined_e = (state['x'] + state['y']) / 2.0
+    if HAVE_TORCH and isinstance(combined_e, torch.Tensor):
+        R_e = torch.abs(torch.mean(torch.exp(1j * combined_e))).item()
+        combined_np = combined_e.cpu().numpy()
+    else:
+        R_e = np.abs(np.mean(np.exp(1j * combined_e)))
+        combined_np = combined_e
+
+    state['awareness'] = awareness
+    return R_e, combined_np
+
 # ---------- Real-time heatmap and coherence animation (runs forever) ----------
 
-def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
-                                      alpha=1.95, eps=0.08, theta_eff=0.0, k_ws=0.002,
-                                      autostart_autotune=False, rolling_window=ROLLING_WINDOW):
-    # State for Option C (Self-Referential)
+def animate_workspace_heatmap_forever(
+    n_layers=500,
+    dt=0.05,
+    alpha=1.95,
+    eps=0.08,
+    theta_eff=0.0,
+    k_ws=0.002,
+    autostart_autotune=False,
+    rolling_window=None
+):
+    if rolling_window is None:
+        try:
+            rolling_window = ROLLING_WINDOW
+        except NameError:
+            rolling_window = 500  # fallback default
+    # Add subplot for goal achievement visualization
+    fig_goal, axes_goal = plt.subplots(5, 1, figsize=(8, 12))
+    goal_lines = []
+
+    # --- Model A ---
+    state_a = {}
+    if HAVE_TORCH:
+        state_a['x'] = torch.randn(n_layers, device=device)
+        state_a['ws'] = torch.tensor(0.0, device=device)
+    else:
+        state_a['x'] = np.random.randn(n_layers)
+        state_a['ws'] = 0.0
+    state_a['R_hist'] = deque(maxlen=ROLLING_WINDOW * 2)
+    state_a['x_history'] = np.zeros((n_layers, REDUCED_HISTORY_SIZE))
+    state_a['step_count'] = 0
+    state_a['max_R'] = -np.inf
+    state_a['cached_entropy'] = 0.0
+    state_a['cached_lyap'] = 0.0
+    state_a['cached_lz'] = 0.0
+
+    # --- Model B ---
+    state_b = {}
+    if HAVE_TORCH:
+        state_b['x'] = torch.randn(n_layers, device=device)
+        state_b['y'] = torch.randn(n_layers, device=device)
+        state_b['why'] = torch.tensor(0.0, device=device)
+        state_b['ws'] = torch.tensor(0.0, device=device)
+    else:
+        state_b['x'] = np.random.randn(n_layers)
+        state_b['y'] = np.random.randn(n_layers)
+        state_b['why'] = 0.0
+        state_b['ws'] = 0.0
+    state_b['R_hist'] = deque(maxlen=ROLLING_WINDOW * 2)
+    state_b['combined_history'] = np.zeros((n_layers, REDUCED_HISTORY_SIZE))
+    state_b['step_count'] = 0
+    state_b['max_R'] = -np.inf
+    state_b['cached_entropy'] = 0.0
+    state_b['cached_lyap'] = 0.0
+    state_b['cached_lz'] = 0.0
+
+    for i, label in enumerate(['A', 'B', 'C', 'D', 'E']):
+        line, = axes_goal[i].plot([], [], label=f'Model {label} Goal/Coherence')
+        axes_goal[i].set_title(f'Model {label} Activity')
+        axes_goal[i].set_xlabel('Step')
+        axes_goal[i].set_ylabel('R or Distance')
+        axes_goal[i].set_ylim(0, 2)
+        goal_lines.append(line)
+    plt.tight_layout()
+    # Plot Model A global coherence R
+    if state_a['step_count'] > 0:
+        goal_lines[0].set_data(
+            np.arange(state_a['step_count']),
+            np.array(state_a['R_hist'])[:state_a['step_count']]
+        )
+        axes_goal[0].set_xlim(0, state_a['step_count'])
+    # Plot Model B global coherence R
+    if state_b['step_count'] > 0:
+        goal_lines[1].set_data(
+            np.arange(state_b['step_count']),
+            np.array(state_b['R_hist'])[:state_b['step_count']]
+        )
+        axes_goal[1].set_xlim(0, state_b['step_count'])
+    # ...existing code for C, D, E plots...
+        state_b['x'] = torch.randn(n_layers, device=device)
+        state_b['y'] = torch.randn(n_layers, device=device)
+        state_b['why'] = torch.tensor(0.0, device=device)
+        state_b['ws'] = torch.tensor(0.0, device=device)
+    else:
+        state_b['x'] = np.random.randn(n_layers)
+        state_b['y'] = np.random.randn(n_layers)
+        state_b['why'] = 0.0
+        state_b['ws'] = 0.0
+    state_b['R_hist'] = deque(maxlen=ROLLING_WINDOW * 2)
+    state_b['combined_history'] = np.zeros((n_layers, REDUCED_HISTORY_SIZE))
+    state_b['step_count'] = 0
+    state_b['max_R'] = -np.inf
+    state_b['cached_entropy'] = 0.0
+    state_b['cached_lyap'] = 0.0
+    state_b['cached_lz'] = 0.0
+    # --- Model C ---
     state_c = {}
+    state_d = {}
     state_c['params'] = {'tau': 0.1, 'coupling': 0.5, 'perturbation': 0.05, 'selfWeight': 0.3, 'antiConvergence': 0.05}
+    state_c['goal_dist_hist'] = []
+    # Add a target pattern (goal) for each model: random or fixed pattern
+    state_c['goal_pattern'] = np.sin(np.linspace(0, 2 * np.pi, n_layers))
     state_c['perturb_phase'] = 0.0
     M = n_layers // 8
     state_c['selfModel'] = np.random.uniform(0, 0.1, M)
@@ -1394,18 +1599,23 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
     state_c['cached_lz'] = 0.0
     
     state_c['predictor'] = None
-    state_c['predicted_self'] = np.zeros(6)
-    state_c['self_model_for_error'] = np.zeros(6)
+    state_c['predicted_self'] = np.zeros(8)
+    state_c['self_model_for_error'] = np.zeros(8)
     state_c['self_model_hist'] = deque(maxlen=2000)
     state_c['self_error_hist'] = deque(maxlen=ROLLING_WINDOW * 2)
     # --- Independent Tuner State ---
     if HAVE_TORCH:
-        state_c['meta_tuner'] = MetaTunerNN()
-        state_c['tuner_optimizer'] = optim.Adam(state_c['meta_tuner'].parameters(), lr=0.01)
+        state_c['meta_tuner'], state_c['tuner_optimizer'] = create_meta_tuner_and_optimizer()
     state_c['experience_buffer'] = deque(maxlen=2500)
+
+    # Add LSTM-based memory buffer for each model
+    if HAVE_TORCH:
+        state_c['lstm_memory'] = nn.LSTM(input_size=n_layers, hidden_size=64, num_layers=1, batch_first=True).to(device)
+        state_c['lstm_hidden'] = None  # (h, c) tuple
 
     # State for Option B Self-Referential
     state_d = {}
+    state_d['goal_dist_hist'] = []
     if HAVE_TORCH:
         state_d['x'] = torch.randn(n_layers, device=device)
         state_d['y'] = torch.randn(n_layers, device=device)
@@ -1421,6 +1631,12 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
     state_d['perturb_phase'] = 0.0
     M = n_layers // 8
     state_d['selfModel'] = np.random.uniform(0, 0.1, M)
+
+    # Add a target pattern (goal) for each model: random or fixed pattern
+    state_d['goal_pattern'] = np.sin(np.linspace(0, 2 * np.pi, n_layers))
+    if HAVE_TORCH:
+        state_d['lstm_memory'] = nn.LSTM(input_size=n_layers, hidden_size=64, num_layers=1, batch_first=True).to(device)
+        state_d['lstm_hidden'] = None
 
     state_d['R_hist'] = deque(maxlen=ROLLING_WINDOW * 2)
     state_d['combined_history'] = np.zeros((n_layers, REDUCED_HISTORY_SIZE))
@@ -1445,15 +1661,37 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
     state_d['self_error_hist'] = deque(maxlen=ROLLING_WINDOW * 2)
     # --- Independent Tuner State ---
     if HAVE_TORCH:
-        state_d['meta_tuner'] = MetaTunerNN()
-        state_d['tuner_optimizer'] = optim.Adam(state_d['meta_tuner'].parameters(), lr=0.01)
+        state_d['meta_tuner'], state_d['tuner_optimizer'] = create_meta_tuner_and_optimizer()
     state_d['experience_buffer'] = deque(maxlen=2500)
+
+    # Option E: Self-Awareness Tuned
+    state_e = copy.deepcopy(state_d)
+    state_e['goal_dist_hist'] = []
+    # Re-initialize meta-tuner and optimizer for state_e after deepcopy
+    if HAVE_TORCH:
+        state_e['meta_tuner'], state_e['tuner_optimizer'] = create_meta_tuner_and_optimizer()
+    # Add a target pattern (goal) for each model: random or fixed pattern
+    state_e['goal_pattern'] = np.sin(np.linspace(0, 2 * np.pi, n_layers))
+    if HAVE_TORCH:
+        state_e['lstm_memory'] = nn.LSTM(input_size=n_layers, hidden_size=64, num_layers=1, batch_first=True).to(device)
+        state_e['lstm_hidden'] = None
+    # Utility: update LSTM memory with new observation
+    def update_lstm_memory(state, obs):
+        if 'lstm_memory' in state and HAVE_TORCH:
+            obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)  # shape (1,1,n_layers)
+            if state['lstm_hidden'] is None:
+                output, hidden = state['lstm_memory'](obs_tensor)
+            else:
+                output, hidden = state['lstm_memory'](obs_tensor, state['lstm_hidden'])
+            state['lstm_hidden'] = (hidden[0].detach(), hidden[1].detach())
+            return output.detach().cpu().numpy()
+        return None
     # Defer starting autotune until after the GUI (figure/animation) is created
     autotune_stop_event = None
     _defer_autostart = bool(autostart_autotune)
 
     # Layout: 4 rows x 3 cols -> one row per model (heatmap | R-phase | self-error)
-    fig, axes = plt.subplots(2, 3, figsize=(21, 10))
+    fig, axes = plt.subplots(3, 2, figsize=(14, 15))
     
     # Common heatmap settings
     heatmap_extent = [0, REDUCED_HISTORY_SIZE, 0, n_layers]
@@ -1462,7 +1700,7 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
     heatmap_c = axes[0,0].imshow(np.zeros((n_layers, REDUCED_HISTORY_SIZE)), aspect='auto',
                                 cmap='hsv', vmin=-1, vmax=1, origin='lower',
                                 extent=heatmap_extent)
-    axes[0,0].set_title('Option C: Self-Referential', fontsize=12, fontweight='bold')
+    axes[0,0].set_title(f'Option C: Self-Referential (n_layers={n_layers})', fontsize=12, fontweight='bold')
     axes[0,0].set_xlabel('Time Step')
     axes[0,0].set_ylabel('Neuron Index')
     line_c, = axes[0,1].plot([], [], 'g', linewidth=1.5, label='Coherence (R)')
@@ -1489,7 +1727,7 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
     heatmap_d = axes[1,0].imshow(np.zeros((n_layers, REDUCED_HISTORY_SIZE)), aspect='auto',
                                 cmap='hsv', vmin=-1, vmax=1, origin='lower',
                                 extent=heatmap_extent)
-    axes[1,0].set_title('Option D: Self-Referential (new)', fontsize=12, fontweight='bold')
+    axes[1,0].set_title(f'Option D: Self-Referential (new, n_layers={n_layers})', fontsize=12, fontweight='bold')
     axes[1,0].set_xlabel('Time Step')
     axes[1,0].set_ylabel('Neuron Index')
     line_d, = axes[1,1].plot([], [], 'purple', linewidth=1.5, label='Coherence (R)')
@@ -1511,6 +1749,33 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
                                      ha='center', va='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
     stability_text_d = axes[1,1].text(0.5, 0.1, "Collecting data...", transform=axes[1,1].transAxes, fontsize=10, color='blue',
                                      ha='center', va='bottom', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    # Option E: Self-Aware Tuned (new)
+    heatmap_e = axes[2,0].imshow(np.zeros((n_layers, REDUCED_HISTORY_SIZE)), aspect='auto',
+                                cmap='hsv', vmin=-1, vmax=1, origin='lower',
+                                extent=[0, REDUCED_HISTORY_SIZE, 0, n_layers])
+    axes[2,0].set_title(f'Option E: Self-Awareness Tuned (n_layers={n_layers})', fontsize=12, fontweight='bold')
+    axes[2,0].set_xlabel('Time Step')
+    axes[2,0].set_ylabel('Neuron Index')
+    line_e, = axes[2,1].plot([], [], 'orange', linewidth=1.5, label='Coherence (R)')
+    axes[2,1].set_xlim(0, ROLLING_WINDOW)
+    axes[2,1].set_ylim(0, 1.01)
+    axes[2,1].set_title('Option E: Coherence & Awareness', fontsize=10)
+    axes[2,1].set_xlabel('Step')
+    axes[2,1].set_ylabel('R (scaled)', color='orange')
+    ax_e_err = axes[2,1].twinx()
+    line_e_err_on_coh, = ax_e_err.plot([], [], 'k--', linewidth=1.0, alpha=0.7, label='Self-Error (norm)')
+    ax_e_err.set_ylim(0, 1.01)
+    ax_e_err.set_ylabel('Self-Error (tanh)', color='k')
+    lines_e, labels_e = axes[2,1].get_legend_handles_labels()
+    lines_e_err, labels_e_err = ax_e_err.get_legend_handles_labels()
+    ax_e_err.legend(lines_e + lines_e_err, labels_e + labels_e_err, loc='lower left', bbox_to_anchor=(0.01, 0.01))
+    diag_e = axes[2,0].text(0.02, 0.98, "", transform=axes[2,0].transAxes, fontsize=9,
+                           verticalalignment='top', bbox=dict(boxstyle='round', facecolor='orange', alpha=0.8))
+    awareness_e_text = axes[2,1].text(0.5, 0.9, "", transform=axes[2,1].transAxes, fontsize=12, color='green',
+                                     ha='center', va='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+    stability_text_e = axes[2,1].text(0.5, 0.1, "Collecting data...", transform=axes[2,1].transAxes, fontsize=10, color='blue',
+                                     ha='center', va='bottom', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
 
 
@@ -1522,7 +1787,28 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
                         bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
     def update_model_state(state, model_type):
-        """Generalized function to update the state of any model."""
+        # Update LSTM memory and get output for decision making
+        if 'lstm_memory' in state and HAVE_TORCH:
+            obs = state['x'].cpu().numpy() if HAVE_TORCH and isinstance(state['x'], torch.Tensor) else state['x']
+            lstm_out = update_lstm_memory(state, obs)
+            state['lstm_last_out'] = lstm_out
+        # Compute LSTM modulation term (mean of output, fallback 0)
+        lstm_mod = 0.0
+        if 'lstm_last_out' in state and state['lstm_last_out'] is not None:
+            if isinstance(state['lstm_last_out'], torch.Tensor):
+                lstm_mod = float(state['lstm_last_out'].detach().cpu().numpy().mean())
+            else:
+                lstm_mod = float(np.mean(state['lstm_last_out']))
+        # (4) Decay LSTM modulation strength over time
+        step = state.get('step_count', 0)
+        lstm_scale = max(0.01, 0.05 * np.exp(-step / 10000))
+        # Compute and store distance to goal for visualization
+        if 'goal_pattern' in state and 'x' in state:
+            x_for_goal = state['x'].cpu().numpy() if HAVE_TORCH and isinstance(state['x'], torch.Tensor) else state['x']
+            goal_dist = np.linalg.norm(x_for_goal - state['goal_pattern']) / len(state['goal_pattern'])
+            if 'goal_dist_hist' in state:
+                state['goal_dist_hist'].append(goal_dist)
+
         # Parameters
         current_alpha = state.get('alpha', alpha)
         current_eps = state.get('eps', eps)
@@ -1534,7 +1820,6 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
             state['x'] += dt * dx
             state['ws'] = (1 - k_ws) * state['ws'] + k_ws * np.mean(state['x'])
             combined_state = state['x']
-
         elif model_type == 'B':
             state['why'] = why_loop_driver(state['why'], 1.2)
             noise = 0.03 * np.random.randn(n_layers)
@@ -1546,90 +1831,152 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
             state['ws'] = (1 - k_ws) * state['ws'] + k_ws * np.mean(combined_state)
             state['x'] += current_eps * state['ws'] * dt
             state['y'] += current_eps * state['ws'] * dt
-
         elif model_type in ['C', 'D']:
             predictor = state.get('predictor', None)
-            predicted_self = state.get('predicted_self', np.zeros(state['self_model'].shape))
-            self_model = state.get('self_model', np.zeros(state['self_model'].shape))
+            self_model = state.get('self_model', np.zeros(8))
+            predicted_self = state.get('predicted_self', np.zeros_like(self_model))
             self_error = np.linalg.norm(predicted_self - self_model)
             self_awareness = 0.01 * self_error * (self_model[0] if self_model.size > 0 else 0.0)
-            state['self_error_hist'].append(self_error)
-
+            noise = 0.03 * np.random.randn(n_layers)
+            lstm_scale = 0.05  # scaling factor for LSTM modulation
             if model_type == 'C':
-                noise = 0.03 * np.random.randn(n_layers)
                 dx = -state['x'] + bistable_layer(state['x'], current_alpha, theta_eff) + current_eps * state['ws'] + self_awareness + noise
+                dx += lstm_scale * lstm_mod  # LSTM modulates action
+                # (2) Add scheduled random exploration every 5000 steps
+                if step % 5000 == 0 and step > 0:
+                    state['alpha'] += np.random.uniform(-0.05, 0.05)
+                    state['eps'] += np.random.uniform(-0.01, 0.01)
                 state['x'] += dt * dx
                 state['ws'] = (1 - k_ws) * state['ws'] + k_ws * np.mean(state['x'])
                 combined_state = state['x']
-            else: # Model D
+            else:  # Model D
                 state['why'] = why_loop_driver(state['why'], 1.2)
-                noise = 0.03 * np.random.randn(n_layers)
                 dx = -state['x'] + bistable_layer(state['x'], current_alpha, theta_eff + 0.2 * state['why']) + self_awareness + noise
                 dy = -state['y'] + bistable_layer(state['y'], current_alpha, theta_eff - 0.2 * state['why']) + self_awareness + noise
+                dx += lstm_scale * lstm_mod
+                dy += lstm_scale * lstm_mod
+                # (2) Add scheduled random exploration every 5000 steps
+                if step % 5000 == 0 and step > 0:
+                    state['alpha'] += np.random.uniform(-0.05, 0.05)
+                    state['eps'] += np.random.uniform(-0.01, 0.01)
                 state['x'] += dt * dx
                 state['y'] += dt * dy
                 combined_state = (state['x'] + state['y']) / 2.0
                 state['ws'] = (1 - k_ws) * state['ws'] + k_ws * np.mean(combined_state)
                 state['x'] += current_eps * state['ws'] * dt
                 state['y'] += current_eps * state['ws'] * dt
+        elif model_type == 'E':
+            # Same as D, but for E (if needed, can be customized)
+            predictor = state.get('predictor', None)
+            self_model = state.get('self_model', np.zeros(8))
+            predicted_self = state.get('predicted_self', np.zeros_like(self_model))
+            self_error = np.linalg.norm(predicted_self - self_model)
+            self_awareness = 0.01 * self_error * (self_model[0] if self_model.size > 0 else 0.0)
+            noise = 0.03 * np.random.randn(n_layers)
+            # (4) Decay LSTM modulation strength over time
+            step = state.get('step_count', 0)
+            lstm_scale = max(0.01, 0.05 * np.exp(-step / 10000))
+            state['why'] = why_loop_driver(state.get('why', 0.0), 1.2)
+            dx = -state['x'] + bistable_layer(state['x'], current_alpha, theta_eff + 0.2 * state['why']) + self_awareness + noise
+            dy = -state['y'] + bistable_layer(state['y'], current_alpha, theta_eff - 0.2 * state['why']) + self_awareness + noise
+            dx += lstm_scale * lstm_mod
+            dy += lstm_scale * lstm_mod
+            # (2) Add scheduled random exploration every 5000 steps
+            if step % 5000 == 0 and step > 0:
+                state['alpha'] += np.random.uniform(-0.05, 0.05)
+                state['eps'] += np.random.uniform(-0.01, 0.01)
+            state['x'] += dt * dx
+            state['y'] += dt * dy
+            combined_state = (state['x'] + state['y']) / 2.0
+            state['ws'] = (1 - k_ws) * state['ws'] + k_ws * np.mean(combined_state)
+            state['x'] += current_eps * state['ws'] * dt
+            state['y'] += current_eps * state['ws'] * dt
+        else:
+            pass  # Add handling for other model types if needed
 
-        # --- Metrics & History ---
-        R = np.mean(np.exp(1j * combined_state)).real
-        state['R_hist'].append(R)
-        state['max_R'] = max(state['max_R'], R)
+    def update_goal_plots(step):
+        for i, state in enumerate([state_c, state_d, state_e]):
+            hist = state.get('goal_dist_hist', [])
+            if len(hist) > 0:
+                goal_lines[i].set_data(np.arange(len(hist)), hist)
+                axes_goal[i].set_xlim(0, max(100, len(hist)))
 
-        history_key = 'x_history' if model_type in ['A', 'C'] else 'combined_history'
-        state[history_key][:, state['step_count'] % REDUCED_HISTORY_SIZE] = combined_state
 
-        # --- Self-Model Encoding (for C and D) ---
-        if model_type == 'C':
-            mean_activity = np.mean(state['x'])
-            std_activity = np.std(state['x'])
-            trend = np.mean(np.diff(state['R_hist'][-10:])) if len(state['R_hist']) > 10 else 0.0
-            ws_norm = np.tanh(state['ws'])
-            entropy = metrics.cached_entropy(np.array(state['R_hist'][-10:]), "C_anim") if len(state['R_hist']) > 10 else 0.0
-            self_model = np.array([mean_activity, std_activity, trend, ws_norm, entropy, R])
-            state['self_model'] = self_model
-        elif model_type == 'D':
-            mean_x = np.mean(state['x'])
-            std_x = np.std(state['x'])
-            mean_y = np.mean(state['y'])
-            std_y = np.std(state['y'])
-            why_val = state['why']
-            ws_val = state['ws']
-            entropy = metrics.cached_entropy(np.array(state['R_hist'][-10:]), "D_anim") if len(state['R_hist']) > 10 else 0.0
-            self_model = np.array([mean_x, std_x, mean_y, std_y, why_val, ws_val, entropy, R])
-            state['self_model'] = self_model
+    # ...existing code...
 
-        if model_type in ['C', 'D']:
-            state['self_model_hist'].append(state['self_model'].copy())
-            if state.get('predictor') is not None:
-                # This part remains non-JIT due to PyTorch
-                pred = state['predictor'](torch.tensor(state['self_model'], dtype=torch.float32).unsqueeze(0)).squeeze(0).numpy()
-                state['predicted_self'] = pred
-
-        # --- Cached Metrics Update ---
-        if metrics.should_update_metrics():
-            recent_R = np.array(state['R_hist'][-30:])
-            entropy_raw = metrics.cached_entropy(recent_R, model_type)
-            state['cached_entropy'] = min(1.0, entropy_raw / 3.0)
-            state['cached_lyap'] = metrics.cached_lyapunov(recent_R, model_type)
-            if state['step_count'] > 10:
-                if len(recent_R) >= 10:
-                    binary_from_r = (recent_R > np.median(recent_R)).astype(int)
-                    state['cached_lz'] = lz_complexity_fast(binary_from_r)
-                else:
-                    binary_state = (combined_state > 0).astype(int)[:200]
-                    state['cached_lz'] = lz_complexity_fast(binary_state)
-
-        state['step_count'] += 1
-        return R
+    # Move the following block inside update_model_state, after the model update logic:
+    # --- Metrics & History ---
+    # (This is a placeholder comment for clarity; actual code is now inside update_model_state)
 
     def update(frame):
+        # --- Update Model A ---
+        curr_alpha_a = alpha
+        curr_eps_a = eps
+        if HAVE_TORCH and isinstance(state_a['x'], torch.Tensor):
+            dx_a = -state_a['x'] + bistable_layer(state_a['x'], curr_alpha_a, theta_eff) + curr_eps_a * state_a['ws'] + 0.03 * torch.randn(n_layers, device=device)
+            state_a['x'] += dt * dx_a
+            state_a['ws'] = (1 - k_ws) * state_a['ws'] + k_ws * torch.mean(state_a['x'])
+            R_a = torch.mean(torch.exp(1j * state_a['x'])).real.item()
+            state_a['R_hist'].append(R_a)
+            state_a['x_history'][:, state_a['step_count'] % REDUCED_HISTORY_SIZE] = state_a['x'].cpu().numpy()
+        else:
+            dx_a = -state_a['x'] + bistable_layer(state_a['x'], curr_alpha_a, theta_eff) + curr_eps_a * state_a['ws'] + 0.03 * np.random.randn(n_layers)
+            state_a['x'] += dt * dx_a
+            state_a['ws'] = (1 - k_ws) * state_a['ws'] + k_ws * np.mean(state_a['x'])
+            R_a = np.mean(np.exp(1j * state_a['x'])).real
+            state_a['R_hist'].append(R_a)
+            state_a['x_history'][:, state_a['step_count'] % REDUCED_HISTORY_SIZE] = state_a['x']
+        state_a['max_R'] = max(state_a['max_R'], R_a)
+        state_a['step_count'] += 1
+
+        # --- Update Model B ---
+        curr_alpha_b = alpha
+        curr_eps_b = eps
+        if HAVE_TORCH and isinstance(state_b['x'], torch.Tensor):
+            state_b['why'] = why_loop_driver(state_b['why'], 1.2)
+            dx_b = -state_b['x'] + bistable_layer(state_b['x'], curr_alpha_b, theta_eff + 0.2 * state_b['why'])
+            dy_b = -state_b['y'] + bistable_layer(state_b['y'], curr_alpha_b, theta_eff - 0.2 * state_b['why'])
+            dx_b += 0.03 * torch.randn(n_layers, device=device)
+            dy_b += 0.03 * torch.randn(n_layers, device=device)
+            state_b['x'] += dt * dx_b
+            state_b['y'] += dt * dy_b
+            combined = (state_b['x'] + state_b['y']) / 2.0
+            state_b['ws'] = (1 - k_ws) * state_b['ws'] + k_ws * torch.mean(combined)
+            state_b['x'] += curr_eps_b * state_b['ws'] * dt
+            state_b['y'] += curr_eps_b * state_b['ws'] * dt
+            R_b = torch.mean(torch.exp(1j * combined)).real.item()
+            state_b['R_hist'].append(R_b)
+            state_b['combined_history'][:, state_b['step_count'] % REDUCED_HISTORY_SIZE] = combined.cpu().numpy()
+        else:
+            state_b['why'] = why_loop_driver(state_b['why'], 1.2)
+            dx_b = -state_b['x'] + bistable_layer(state_b['x'], curr_alpha_b, theta_eff + 0.2 * state_b['why'])
+            dy_b = -state_b['y'] + bistable_layer(state_b['y'], curr_alpha_b, theta_eff - 0.2 * state_b['why'])
+            dx_b += 0.03 * np.random.randn(n_layers)
+            dy_b += 0.03 * np.random.randn(n_layers)
+            state_b['x'] += dt * dx_b
+            state_b['y'] += dt * dy_b
+            combined = (state_b['x'] + state_b['y']) / 2.0
+            state_b['ws'] = (1 - k_ws) * state_b['ws'] + k_ws * np.mean(combined)
+            state_b['x'] += curr_eps_b * state_b['ws'] * dt
+            state_b['y'] += curr_eps_b * state_b['ws'] * dt
+            R_b = np.mean(np.exp(1j * combined)).real
+            state_b['R_hist'].append(R_b)
+            state_b['combined_history'][:, state_b['step_count'] % REDUCED_HISTORY_SIZE] = combined
+        state_b['max_R'] = max(state_b['max_R'], R_b)
+        state_b['step_count'] += 1
         if frame == 0:
             print(f"[{time.time() - script_start_time:.4f}s] First animation frame update.")
         start_time = time.perf_counter()
                 
+        # --- Reward-Triggered Training: Track previous reward for C, D, E ---
+        prev_reward_c = getattr(state_c, '_prev_reward', 0.0)
+        prev_reward_d = getattr(state_d, '_prev_reward', 0.0)
+        prev_reward_e = getattr(state_e, '_prev_reward', 0.0)
+        # (3) Reward shaping for small improvements
+        prev_goal_dist_c = getattr(state_c, '_prev_goal_dist', None)
+        prev_goal_dist_d = getattr(state_d, '_prev_goal_dist', None)
+        prev_goal_dist_e = getattr(state_e, '_prev_goal_dist', None)
+
         # --- Update Model C ---
         curr_alpha_c = state_c['alpha']
         curr_eps_c = state_c['eps']
@@ -1661,7 +2008,23 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
             if len(recent_R) >= 10:
                 binary_from_r = (recent_R > np.median(recent_R)).astype(int)
                 state_c['cached_lz'] = lz_complexity_fast(binary_from_r)
+            state_c['cached_r2'] = metrics.cached_self_r2(state_c['self_model_hist'], "C")
         state_c['step_count'] += 1
+
+        # --- Reward logic for C ---
+        goal_dist_c = state_c['goal_dist_hist'][-1] if len(state_c['goal_dist_hist']) > 0 else 0.0
+        if prev_goal_dist_c is not None:
+            curr_reward_c = -goal_dist_c + 0.01 * (prev_goal_dist_c - goal_dist_c)
+        else:
+            curr_reward_c = -goal_dist_c
+        state_c['reward'] = curr_reward_c
+        state_c['_prev_goal_dist'] = goal_dist_c
+        if curr_reward_c > prev_reward_c and 'meta_tuner' in state_c and 'tuner_optimizer' in state_c and 'experience_buffer' in state_c:
+            # (5) Adaptive batch size for meta-tuner
+            batch_size = min(64, max(5, len(state_c['experience_buffer']) // 2))
+            if len(state_c['experience_buffer']) >= 5:
+                train_meta_tuner_batch(state_c['meta_tuner'], state_c['tuner_optimizer'], state_c['experience_buffer'], batch_size=batch_size)
+        state_c['_prev_reward'] = curr_reward_c
         
         # --- Update Model D ---
         curr_alpha_d = state_d['alpha']
@@ -1694,10 +2057,79 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
             if len(recent_R_d) >= 10:
                 binary_from_r_d = (recent_R_d > np.median(recent_R_d)).astype(int)
                 state_d['cached_lz'] = lz_complexity_fast(binary_from_r_d)
+            state_d['cached_r2'] = metrics.cached_self_r2(state_d['self_model_hist'], "D")
         state_d['step_count'] += 1
+
+        # --- Reward logic for D ---
+        goal_dist_d = state_d['goal_dist_hist'][-1] if len(state_d['goal_dist_hist']) > 0 else 0.0
+        if prev_goal_dist_d is not None:
+            curr_reward_d = -goal_dist_d + 0.01 * (prev_goal_dist_d - goal_dist_d)
+        else:
+            curr_reward_d = -goal_dist_d
+        state_d['reward'] = curr_reward_d
+        state_d['_prev_goal_dist'] = goal_dist_d
+        if curr_reward_d > prev_reward_d and 'meta_tuner' in state_d and 'tuner_optimizer' in state_d and 'experience_buffer' in state_d:
+            batch_size = min(64, max(5, len(state_d['experience_buffer']) // 2))
+            if len(state_d['experience_buffer']) >= 5:
+                train_meta_tuner_batch(state_d['meta_tuner'], state_d['tuner_optimizer'], state_d['experience_buffer'], batch_size=batch_size)
+        state_d['_prev_reward'] = curr_reward_d
+
+        # Update Model E
+        curr_alpha_e = state_e['alpha']
+        curr_eps_e = state_e['eps']
+        R_raw_e, combined_e = _update_dynamics_e(state_e, n_layers, dt, curr_alpha_e, curr_eps_e, theta_eff, k_ws)
+        R_e = R_raw_e
+        state_e['R_hist'].append(R_e)
+        state_e['combined_history'][:, state_e['step_count'] % REDUCED_HISTORY_SIZE] = combined_e
+        heatmap_e.set_data(state_e['combined_history'])
+        state_e['max_R'] = max(state_e['max_R'], R_e)
+        phi_e = phi_proxy(combined_e)
+        state_e['alpha_hist'].append(curr_alpha_e)
+        state_e['eps_hist'].append(curr_eps_e)
+        state_e['phi_hist'].append(phi_e)
+        if abs(curr_alpha_e - state_e['prev_alpha']) > 0.001:
+            state_e['alpha_changes'].append(state_e['step_count'])
+        state_e['prev_alpha'] = curr_alpha_e
+        if abs(curr_eps_e - state_e['prev_eps']) > 0.001:
+            state_e['eps_changes'].append(state_e['step_count'])
+        state_e['prev_eps'] = curr_eps_e
+        if metrics.should_update_metrics():
+            recent_R_e = np.array(list(state_e['R_hist'])[-30:])
+            entropy_raw_e = metrics.cached_entropy(recent_R_e, "E")
+            state_e['cached_entropy'] = min(1.0, entropy_raw_e / 3.0)
+            state_e['cached_lyap'] = metrics.cached_lyapunov(recent_R_e, "E")
+            if len(recent_R_e) >= 10:
+                binary_from_r_e = (recent_R_e > np.median(recent_R_e)).astype(int)
+                state_e['cached_lz'] = lz_complexity_fast(binary_from_r_e)
+            state_e['cached_r2'] = metrics.cached_self_r2(state_e['self_model_hist'], "E")
+        state_e['step_count'] += 1
+
+        # --- Reward logic for E ---
+        goal_dist_e = state_e['goal_dist_hist'][-1] if len(state_e['goal_dist_hist']) > 0 else 0.0
+        if prev_goal_dist_e is not None:
+            curr_reward_e = -goal_dist_e + 0.01 * (prev_goal_dist_e - goal_dist_e)
+        else:
+            curr_reward_e = -goal_dist_e
+        state_e['reward'] = curr_reward_e
+        state_e['_prev_goal_dist'] = goal_dist_e
+        if curr_reward_e > prev_reward_e and 'meta_tuner' in state_e and 'tuner_optimizer' in state_e and 'experience_buffer' in state_e:
+            batch_size = min(64, max(5, len(state_e['experience_buffer']) // 2))
+            if len(state_e['experience_buffer']) >= 5:
+                train_meta_tuner_batch(state_e['meta_tuner'], state_e['tuner_optimizer'], state_e['experience_buffer'], batch_size=batch_size)
+        state_e['_prev_reward'] = curr_reward_e
+        # (1) Gradually increase meta-tuner learning rate if plateau
+        for state in [state_c, state_d, state_e]:
+            if len(state['goal_dist_hist']) > 1000:
+                recent = state['goal_dist_hist'][-1000:]
+                if np.std(recent) < 0.001:  # Plateau detected
+                    for param_group in state['tuner_optimizer'].param_groups:
+                        param_group['lr'] = min(param_group['lr'] * 1.05, 0.2)  # Cap at 0.2
+
         # Update line plots with rolling window
         current_len_c = len(state_c['R_hist'])
         current_len_d = len(state_d['R_hist'])
+        current_len_e = len(state_e['R_hist'])
+        current_len_e = len(state_e['R_hist'])
 
         if current_len_c > ROLLING_WINDOW:
             scaled_r_c = (np.array(list(state_c['R_hist'])[-ROLLING_WINDOW:]) + 1) / 2
@@ -1716,50 +2148,134 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
             scaled_r_d = (np.array(state_d['R_hist']) + 1) / 2
             scaled_error_d = np.tanh(np.array(state_d['self_error_hist']))
             x_data_d = np.arange(current_len_d)
+        
+        if current_len_e > ROLLING_WINDOW:
+            scaled_r_e = (np.array(list(state_e['R_hist'])[-ROLLING_WINDOW:]) + 1) / 2
+            scaled_error_e = np.tanh(np.array(list(state_e['self_error_hist'])[-ROLLING_WINDOW:]))
+            x_data_e = np.arange(ROLLING_WINDOW)
+        else:
+            scaled_r_e = (np.array(state_e['R_hist']) + 1) / 2
+            scaled_error_e = np.tanh(np.array(state_e['self_error_hist']))
+            x_data_e = np.arange(current_len_e)
 
         line_c.set_data(x_data_c, scaled_r_c)
         line_d.set_data(x_data_d, scaled_r_d)
+        line_e.set_data(x_data_e, scaled_r_e)
         line_c_err_on_coh.set_data(x_data_c, scaled_error_c)
         line_d_err_on_coh.set_data(x_data_d, scaled_error_d)
+        line_e_err_on_coh.set_data(x_data_e, scaled_error_e)
+
+
+
+        # --- Awareness metric for C (smoothed) ---
+        awareness_c = 0.0
+        window_c = 200
+        if len(state_c['self_error_hist']) >= window_c:
+            recent_self_error_c = np.array(list(state_c['self_error_hist'])[-window_c:])
+            smoothed_c = np.convolve(recent_self_error_c, np.ones(5)/5, mode='valid')
+            std_self_error_c = np.std(smoothed_c)
+            awareness_c = max(0.0, 1.0 - std_self_error_c / 0.1)
+        state_c['awareness'] = awareness_c
+
+        # --- Awareness metric for D (smoothed) ---
+        awareness_d = 0.0
+        window_d = 200
+        if len(state_d['self_error_hist']) >= window_d:
+            recent_self_error_d = np.array(list(state_d['self_error_hist'])[-window_d:])
+            smoothed_d = np.convolve(recent_self_error_d, np.ones(5)/5, mode='valid')
+            std_self_error_d = np.std(smoothed_d)
+            awareness_d = max(0.0, 1.0 - std_self_error_d / 0.1)
+        state_d['awareness'] = awareness_d
+
+        # --- Awareness metric for E (smoothed) ---
+        awareness_e = 0.0
+        window_e = 200
+        if len(state_e['self_error_hist']) >= window_e:
+            recent_self_error_e = np.array(list(state_e['self_error_hist'])[-window_e:])
+            smoothed_e = np.convolve(recent_self_error_e, np.ones(5)/5, mode='valid')
+            std_self_error_e = np.std(smoothed_e)
+            awareness_e = max(0.0, 1.0 - std_self_error_e / 0.1)
+        state_e['awareness'] = awareness_e
 
         # Update diagnostics with optimized metrics
         R_c_display = R_c if np.isfinite(R_c) else 0.0
         max_R_c_display = state_c['max_R'] if np.isfinite(state_c['max_R']) else 0.0
         R_d_display = R_d if 'R_d' in locals() and np.isfinite(R_d) else 0.0
         max_R_d_display = state_d['max_R'] if np.isfinite(state_d['max_R']) else 0.0
-        
-        
-        
+
         # Get the latest self_error values from histories
         current_self_error_c = state_c['self_error_hist'][-1] if state_c['self_error_hist'] else 0.0
         current_self_error_d = state_d['self_error_hist'][-1] if state_d['self_error_hist'] else 0.0
 
         phi_n_c = state_c['phi_hist'][-1] / n_layers if state_c['phi_hist'] else 0.0
+        r2_c = state_c.get('cached_r2', 0.0)
         diag_c.set_text(
             f"R: {R_c_display:.3f} | Max: {max_R_c_display:.3f} | α:{state_c['alpha']:.3f} ε:{state_c['eps']:.3f}\n"
             f"Entropy: {state_c['cached_entropy']:.3f} | Φ/N: {phi_n_c:.2f}\n"
-            f"LZ: {state_c['cached_lz']:.2f} | Self-err: {current_self_error_c:.3f}\n"
-            f"Step: {state_c['step_count']} | Frame: {time.perf_counter() - start_time:.3f}s"
+            f"LZ: {state_c['cached_lz']:.2f} | Self-err: {current_self_error_c:.3f} | R2-self: {r2_c:.3f}\n"
+            f"Awareness: {awareness_c:.3f} | Step: {state_c['step_count']} | Frame: {time.perf_counter() - start_time:.3f}s"
         )
-        
+
         phi_n_d = state_d['phi_hist'][-1] / n_layers if state_d['phi_hist'] else 0.0
+        r2_d = state_d.get('cached_r2', 0.0)
         diag_d.set_text(
             f"R: {R_d_display:.3f} | Max: {max_R_d_display:.3f} | α:{state_d['alpha']:.3f} ε:{state_d['eps']:.3f}\n"
             f"Entropy: {state_d['cached_entropy']:.3f} | Φ/N: {phi_n_d:.2f}\n"
-            f"LZ: {state_d['cached_lz']:.2f} | Self-err: {current_self_error_d:.3f}\n"
-            f"Step: {state_d['step_count']} | Frame: {time.perf_counter() - start_time:.3f}s"
+            f"LZ: {state_d['cached_lz']:.2f} | Self-err: {current_self_error_d:.3f} | R2-self: {r2_d:.3f}\n"
+            f"Awareness: {awareness_d:.3f} | Step: {state_d['step_count']} | Frame: {time.perf_counter() - start_time:.3f}s"
         )
+
+        # Update diagnostics for Model E
+        R_e_display = R_e if np.isfinite(R_e) else 0.0
+        max_R_e_display = state_e['max_R'] if np.isfinite(state_e['max_R']) else 0.0
+        current_self_error_e = state_e['self_error_hist'][-1] if state_e['self_error_hist'] else 0.0
+        phi_n_e = state_e['phi_hist'][-1] / n_layers if state_e['phi_hist'] else 0.0
+        r2_e = state_e.get('cached_r2', 0.0)
+        diag_e.set_text(f"R: {R_e_display:.3f} | Max: {max_R_e_display:.3f} | α:{state_e['alpha']:.3f} ε:{state_e['eps']:.3f}\nEntropy: {state_e['cached_entropy']:.3f} | Φ/N: {phi_n_e:.2f}\nLZ: {state_e['cached_lz']:.2f} | Self-err: {current_self_error_e:.3f} | R2-self: {r2_e:.3f}\nAwareness: {state_e.get('awareness', 0.0):.3f} | Step: {state_e['step_count']}")
         
+
         # Update performance info
-        max_step = max( state_c['step_count'], state_d['step_count'])
+        max_step = max(state_c['step_count'], state_d['step_count'], state_e['step_count'])
         compute_time = time.perf_counter() - start_time
         step_text.set_text(f"Step: {max_step} | FPS: {min(1000/(compute_time*1000), 20):.1f}")
-        
+
         perf_text.set_text(
             f"Original with Optimizations | Cache: {ENABLE_CACHING} | "
             f"Update every {METRIC_UPDATE_INTERVAL} frames | "
             f"History: {REDUCED_HISTORY_SIZE}"
         )
+
+        # Update stability status for Model E
+        if len(state_e['self_error_hist']) > 50 and len(state_e['R_hist']) > 50:
+            recent_self_errors_e = np.array(list(state_e['self_error_hist'])[-50:])
+            mean_self_error_e = np.mean(recent_self_errors_e)
+            std_self_error_e = np.std(recent_self_errors_e)
+            current_self_error_e = state_e['self_error_hist'][-1]
+
+            recent_coherence_e = np.array(list(state_e['R_hist'])[-50:])
+            mean_coherence_e = np.mean(recent_coherence_e)
+            std_coherence_e = np.std(recent_coherence_e)
+            current_coherence_e = state_e['R_hist'][-1]
+
+            error_is_stable_e = abs(current_self_error_e - mean_self_error_e) <= std_self_error_e
+            coherence_is_stable_e = abs(current_coherence_e - mean_coherence_e) <= std_coherence_e
+
+            if error_is_stable_e and coherence_is_stable_e:
+                stability_text_e.set_text("Stabilized")
+                stability_text_e.set_color('green')
+            else:
+                stability_text_e.set_text("Unstable")
+                stability_text_e.set_color('red')
+
+        # Update awareness dialog for Model E
+        stable_threshold = 0.8
+        error_stability_threshold = 0.05
+        is_aware_e = False
+        if len(state_e['self_error_hist']) > 50:
+            error_std_dev_e = np.std(list(state_e['self_error_hist'])[-50:])
+            if R_e > stable_threshold and error_std_dev_e < error_stability_threshold:
+                is_aware_e = True
+        awareness_e_text.set_text("Stable Self-Awareness" if is_aware_e else "")
 
         # Update stability status
         if len(state_c['self_error_hist']) > 50 and len(state_c['R_hist']) > 50:
@@ -1822,11 +2338,12 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
                 is_aware_d = True
         awareness_d_text.set_text("Stable Self-Awareness" if is_aware_d else "")
 
-        return (heatmap_c, heatmap_d, line_c, line_d,
-                line_c_err_on_coh, line_d_err_on_coh,
-                diag_c, diag_d, perf_text, step_text,
-                stability_text_c, stability_text_d,
-                awareness_c_text, awareness_d_text)
+        return (heatmap_c, heatmap_d, heatmap_e,
+            line_c, line_d, line_e,
+            line_c_err_on_coh, line_d_err_on_coh, line_e_err_on_coh,
+            diag_c, diag_d, diag_e, perf_text, step_text,
+            stability_text_c, stability_text_d, stability_text_e,
+            awareness_c_text, awareness_d_text, awareness_e_text)
 
     # Create animation with optimized interval
     ani = FuncAnimation(fig, update, interval=50, blit=False, cache_frame_data=False)
@@ -1842,15 +2359,37 @@ def animate_workspace_heatmap_forever(n_layers=100, dt=0.05,
     
     if _defer_autostart:
         try:
-            autotune_stop_event, _ = start_autotune_for_states([state_c, state_d], interval=1.0, retrain_every=10)
+            autotune_stop_event, _ = start_autotune_for_states([state_c, state_d, state_e], interval=1.0, retrain_every=10)
         except Exception as e:
             print("[animate_workspace_heatmap_forever] failed to start autotune thread:", e)
 
     plt.tight_layout()
     fig.canvas.mpl_connect('close_event', handle_close)
+
+    # --- Add Stop Button to GUI ---
+    from matplotlib.widgets import Button
+    stop_ax = fig.add_axes([0.45, 0.01, 0.1, 0.05])
+    stop_button = Button(stop_ax, 'Stop', color='red', hovercolor='salmon')
+    def on_stop(event):
+        print("[Stop Button] Stopping simulation and closing window...")
+        plt.close(fig)
+    stop_button.on_clicked(on_stop)
+
     plt.subplots_adjust(bottom=0.1, hspace=0.4)
     print(f"[{time.time() - script_start_time:.4f}s] About to show plot. The GUI window should appear now.")
-    plt.show()
+
+    # --- Handle Ctrl+C (KeyboardInterrupt) gracefully ---
+    import signal
+    def signal_handler(sig, frame):
+        print("\n[Ctrl+C] KeyboardInterrupt received. Stopping simulation and closing window...")
+        plt.close(fig)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    try:
+        plt.show()
+    except KeyboardInterrupt:
+        print("[KeyboardInterrupt] Simulation stopped by user.")
+        plt.close(fig)
 
 # ---------- Parameter sweep diagnostics for "awareness" (high complexity) ----------
 def shannon_entropy(data, bins=50):
@@ -1997,14 +2536,15 @@ EPS_MIN, EPS_MAX = 0.01, 0.2
 
 if HAVE_TORCH:
     class MetaTunerNN(nn.Module):
-        def __init__(self):
+        def __init__(self, lstm_out_dim=64):
             super().__init__()
+            self.lstm_out_dim = lstm_out_dim
             self.net = nn.Sequential(
-                nn.Linear(4, 16),
+                nn.Linear(4 + lstm_out_dim, 32),
                 nn.ReLU(),
-                nn.Linear(16, 8),
+                nn.Linear(32, 16),
                 nn.ReLU(),
-                nn.Linear(8, 4),  # alpha, eps, anti_mult, noise_mult
+                nn.Linear(16, 4),  # alpha, eps, anti_mult, noise_mult
                 nn.Sigmoid()
             )
         def forward(self, x):
@@ -2024,12 +2564,19 @@ if HAVE_TORCH:
         def forward(self, x):
             return self.net(x)
 
-    meta_tuner = MetaTunerNN()
-    optimizer = optim.Adam(meta_tuner.parameters(), lr=0.01)
+    meta_tuner = MetaTunerNN(lstm_out_dim=64)
+    optimizer = optim.Adam(meta_tuner.parameters(), lr=0.05)
 
-    def meta_autotune_update(tuner, entropy, r, lyap, complexity):
+    def meta_autotune_update(tuner, entropy, r, lyap, complexity, lstm_out=None):
         # Prepare input tensor
-        x = torch.tensor([entropy, r, lyap, complexity], dtype=torch.float32)
+        features = [entropy, r, lyap, complexity]
+        if lstm_out is not None:
+            if isinstance(lstm_out, torch.Tensor):
+                lstm_out = lstm_out.detach().cpu().numpy().flatten()
+            features = features + list(lstm_out)
+        else:
+            features = features + [0.0]*64
+        x = torch.tensor(features, dtype=torch.float32)
         with torch.no_grad():
             out = tuner(x)
         # Scale outputs to parameter ranges
@@ -2108,9 +2655,16 @@ phase_offsets = 0.01337 * np.arange(n_layers)  # Per-neuron phase
 # Experience buffer for meta-tuner (features -> normalized params)
 experience_buffer = deque(maxlen=10000)  # stores tuples (features, norm_params, reward)
 
-# Reward weighting (entropy weight, r weight)
-REWARD_W_ENTROPY = 2.5  # Prioritizing entropy for high diversity
-REWARD_W_R = 0.9999       # Ignoring r to focus on entropy
+
+# Reward weights are now stored in the state and auto-tuned online
+DEFAULT_REWARD_WEIGHTS = {
+    'entropy': 2.5,
+    'r': 0.9999,
+    'awareness': 1.0,
+    'selferr': 1.0
+}
+REWARD_UPDATE_INTERVAL = 500  # steps between weight updates
+REWARD_PERTURB_SCALE = 0.2    # max random change per update
 
 # rollout config (steps to simulate after applying params to estimate causal reward)
 ROLLOUT_STEPS = 50
@@ -2138,14 +2692,38 @@ def _autotune_worker(states, stop_event, interval=1.0, retrain_every=20):
                 r = float(R_hist[-1]) if len(R_hist) > 0 else 0.0
                 lyap = lyapunov_proxy(R_hist)
                 complexity = entropy + lyap
+                # Initialize reward weights in state if not present
+                if 'reward_weights' not in state:
+                    state['reward_weights'] = DEFAULT_REWARD_WEIGHTS.copy()
+
+                # Online reward weight update every REWARD_UPDATE_INTERVAL steps
+                if state.get('step_count', 0) % REWARD_UPDATE_INTERVAL == 0 and state.get('step_count', 0) > 0:
+                    # Simple random perturbation
+                    for k in state['reward_weights']:
+                        perturb = np.random.uniform(-REWARD_PERTURB_SCALE, REWARD_PERTURB_SCALE)
+                        state['reward_weights'][k] = max(0.0, state['reward_weights'][k] + perturb)
+                    # Optionally normalize or clip weights
+                    total = sum(state['reward_weights'].values())
+                    if total > 0:
+                        for k in state['reward_weights']:
+                            state['reward_weights'][k] /= total
                 if HAVE_TORCH and 'meta_tuner' in state:
-                    out = state['meta_tuner'](torch.tensor([entropy, r, lyap, complexity], dtype=torch.float32))
+                    lstm_out = state.get('lstm_last_out', None)
+                    features = [entropy, r, lyap, complexity]
+                    if lstm_out is not None:
+                        if isinstance(lstm_out, torch.Tensor):
+                            lstm_out = lstm_out.detach().cpu().numpy().flatten()
+                        features = features + list(lstm_out)
+                    else:
+                        features = features + [0.0]*64
+                    out = state['meta_tuner'](torch.tensor(features, dtype=torch.float32))
                     alpha_s = ALPHA_MIN + (ALPHA_MAX - ALPHA_MIN) * out[0].item()
                     eps_s = EPS_MIN + (EPS_MAX - EPS_MIN) * out[1].item()
                     anti_mult = 0.5 + 1.5 * out[2].item()  # [0.5,2.0]
                     noise_mult = 0.5 + 1.5 * out[3].item()
                 else:
-                    alpha_s, eps_s = meta_autotune_update(entropy, r, lyap, complexity)
+                    lstm_out = state.get('lstm_last_out', None)
+                    alpha_s, eps_s = meta_autotune_update(entropy, r, lyap, complexity, lstm_out)
                     anti_mult = 1.2
                     noise_mult = 1.2
                 state['alpha'] = alpha_s
@@ -2162,13 +2740,23 @@ def _autotune_worker(states, stop_event, interval=1.0, retrain_every=20):
             try:
                 rollout_reward = _estimate_rollout_reward(state, alpha_s, eps_s, steps=ROLLOUT_STEPS, dt=ROLLOUT_DT)
             except Exception:
+                REWARD_W_ENTROPY = 2.5
+                REWARD_W_R = 0.9999
                 rollout_reward = REWARD_W_ENTROPY * entropy + REWARD_W_R * r
 
             # record into experience buffer normalized; include rollout reward to train toward
             norm_alpha = (alpha_s - ALPHA_MIN) / (ALPHA_MAX - ALPHA_MIN) if (ALPHA_MAX - ALPHA_MIN) != 0 else 0.0
             norm_eps = (eps_s - EPS_MIN) / (EPS_MAX - EPS_MIN) if (EPS_MAX - EPS_MIN) != 0 else 0.0
             if 'experience_buffer' in state:
-                state['experience_buffer'].append(((entropy, r, lyap, complexity), (norm_alpha, norm_eps), float(rollout_reward)))
+                lstm_out = state.get('lstm_last_out', None)
+                features = [entropy, r, lyap, complexity]
+                if lstm_out is not None:
+                    if isinstance(lstm_out, torch.Tensor):
+                        lstm_out = lstm_out.detach().cpu().numpy().flatten()
+                    features = features + list(lstm_out)
+                else:
+                    features = features + [0.0]*64
+                state['experience_buffer'].append((features, (norm_alpha, norm_eps), float(rollout_reward)))
 
         counter += 1
         # occasional retraining: train self-model predictor if enough history
@@ -2234,7 +2822,11 @@ def _estimate_rollout_reward(state, alpha_s, eps_s, steps=10, dt=0.01):
         R_arr = np.array(R_roll)
     else:
         # Option A or C
-        x = state['x'].copy()
+        x = state['x']
+        if hasattr(x, 'cpu'):
+            x = x.clone().cpu().numpy()
+        else:
+            x = x.copy()
         ws = float(state.get('ws', 0.0))
         R_roll = []
         # include self-awareness if present
@@ -2258,7 +2850,62 @@ def _estimate_rollout_reward(state, alpha_s, eps_s, steps=10, dt=0.01):
     final_r = float(R_arr[-1]) if len(R_arr) > 0 else 0.0
     # Shape R reward to peak at ~0.99 for edge-of-chaos
     r_shaped = final_r * np.exp( -((final_r - 0.99)/0.01)**2 )
-    reward = REWARD_W_ENTROPY * entropy + REWARD_W_R * r_shaped
+
+    # Awareness: use the same smoothed std metric as in main loop, if available
+    awareness = 0.0
+    mean_self_error = 0.0
+    window_awareness = 200
+    if 'self_error_hist' in state and len(state['self_error_hist']) >= window_awareness:
+        recent_self_error = np.array(list(state['self_error_hist'])[-window_awareness:])
+        smoothed = np.convolve(recent_self_error, np.ones(5)/5, mode='valid')
+        std_self_error = np.std(smoothed)
+        mean_self_error = np.mean(smoothed)
+        awareness = max(0.0, 1.0 - std_self_error / 0.1)
+
+    # Compute phi proxy (integrated information proxy)
+    phi = 0.0
+    # Use the most recent neural state for phi calculation
+    if 'x' in state:
+        x_for_phi = state['x']
+        if hasattr(x_for_phi, 'cpu'):
+            x_for_phi = x_for_phi.cpu().numpy()
+        phi = phi_proxy(np.array(x_for_phi))
+    elif 'neurons' in state:
+        phi = phi_proxy(np.array(state['neurons']))
+    # Store phi in state for analysis/plotting
+    state['phi_proxy'] = phi
+
+    # Use online-tuned weights from state if available
+    weights = state.get('reward_weights', DEFAULT_REWARD_WEIGHTS)
+    # Goal: minimize distance to target pattern (goal_pattern)
+    goal_term = 1.0
+    if 'goal_pattern' in state and 'x' in state:
+        x_for_goal = state['x']
+        if hasattr(x_for_goal, 'cpu'):
+            x_for_goal = x_for_goal.cpu().numpy()
+        goal_pattern = state['goal_pattern']
+        goal_dist = np.linalg.norm(x_for_goal - goal_pattern) / len(goal_pattern)
+        goal_term = max(1e-3, 1.0 - goal_dist)  # Higher when closer to goal
+
+    # Option to use product-based reward (miniBrain.tsx style)
+    USE_PRODUCT_REWARD = state.get('use_product_reward', True)
+    if USE_PRODUCT_REWARD:
+        # All terms are shifted/scaled to be positive and nonzero
+        entropy_term = max(1e-3, weights['entropy'] * entropy)
+        r_term = max(1e-3, weights['r'] * r_shaped)
+        awareness_term = max(1e-3, weights['awareness'] * awareness)
+        selferr_term = max(1e-3, weights['selferr'] * (1.0 - min(mean_self_error, 1.0)))
+        phi_term = max(1e-3, phi)
+        reward = entropy_term * r_term * awareness_term * selferr_term * phi_term * goal_term
+    else:
+        reward = (
+            weights['entropy'] * entropy
+            + weights['r'] * r_shaped
+            + weights['awareness'] * awareness
+            + weights['selferr'] * (1.0 - min(mean_self_error, 1.0))
+            + phi
+            + goal_term
+        )
     return float(reward)
     
     # sleep until next cycle handled in _autotune_worker
@@ -2324,7 +2971,8 @@ def train_meta_tuner_batch(tuner, optimizer, experience, batch_size=64, n_epochs
 
     # Apply IPEX CPU optimization if available
     if HAVE_IPEX and device.type == 'cpu':
-        ipex.optimize(tuner, optimizer=optimizer)
+        if ipex is not None and hasattr(ipex, 'optimize'):
+            ipex.optimize(tuner, optimizer=optimizer)
 
     opt = optimizer
     loss_fn = nn.MSELoss(reduction='none')
@@ -2335,13 +2983,15 @@ def train_meta_tuner_batch(tuner, optimizer, experience, batch_size=64, n_epochs
         loss_mat = loss_fn(pred, Y_t)
         # apply weights
         loss = (loss_mat * W_t).mean()
+        # Avoid in-place operations in backward
+        loss = loss.clone()
         loss.backward()
         opt.step()
 
     return True
 
 
-def _meta_trainer_worker(state, stop_event, interval=5.0, batch_size=64):
+def _meta_trainer_worker(state, stop_event, interval=5.0, batch_size=128):
     """Background meta-tuner trainer: periodically samples experience buffer and trains meta_tuner."""
     while not stop_event.is_set():
         try:
